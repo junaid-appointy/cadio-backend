@@ -27,8 +27,12 @@
   Tools = `run_cad` (execute+validate, returns measured facts) and `ask_user`
   (batched Q&A, defaults). System prompt = program contract + corpus seed
   (`agent/corpus.py`). CLI REPL: `python -m forma.cli chat`.
-- **Web workspace — the primary surface** (`forma/api/app.py`, `web/index.html`):
+- **Web workspace — the primary surface** (`forma/api/app.py` + `frontend/`,
+  a **React 19 + TypeScript + Vite** app using @react-three/fiber + drei):
   three panes — chat / 3D viewer / tabbed side panel (Params · Code · Runs).
+  Dev: `npm run dev` in `frontend/` (proxies /api, /runs, /ws to uvicorn on
+  :8000). Prod: `npm run build` → FastAPI serves `frontend/dist` at `/`
+  (returns a 503 hint if the build is missing).
   - **WebSocket `/ws/chat?model=`** runs the agent loop server-side; events to
     the browser: `status` (thinking / building), `ask_user` (rendered as an
     inline form; answers round-trip to the blocked agent thread via a queue),
@@ -63,6 +67,15 @@ the answered dimension (150mm) measured in the produced geometry.
 - [ ] Image upload in web chat (reference photos → vision models)
 
 ## Build log
+
+**2026-07-02 — frontend moved to React + Vite + TypeScript.** The v0 single
+vanilla-JS HTML file (chosen to keep the slice build-tool-free) is replaced by
+a proper app in `frontend/`: components (Chat, Viewer, SidePanel), a `useChat`
+websocket hook, typed API layer, @react-three/fiber viewer with drei Bounds
+auto-fit. Next.js was considered and rejected: no SSR/SEO needs for a
+canvas + websocket workspace; Vite dev-proxy + static build is the fit.
+Verified via TestClient: React index + hashed assets served, agent ws flow
+green.
 
 **2026-07-02 — agent made provider-agnostic.** Orchestrator moved from the
 Anthropic SDK to LiteLLM (OpenAI wire format for messages/tool calls) so any

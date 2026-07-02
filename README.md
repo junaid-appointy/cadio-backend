@@ -15,6 +15,7 @@ browser viewer, plus a Claude agent loop on top.
 ```sh
 uv venv --python 3.12 .venv
 uv pip install -e .
+cd frontend && npm install && npm run build && cd ..
 ```
 
 > First execution can be slow (~1–2 min): macOS verifies the OCCT dylib once.
@@ -33,6 +34,9 @@ forms), watch the model appear in the 3D viewer, tweak dimensions with the
 Params sliders (rebuilds without the LLM), edit raw code in the Code tab,
 reload old versions from Runs, export STL/STEP/GLB top-right. Set the model id
 in the header (LiteLLM format, e.g. `gemini/gemini-2.5-pro`) and hit connect.
+
+Frontend dev (hot reload): `cd frontend && npm run dev` → http://localhost:5173
+(proxies API/websocket/artifacts to uvicorn on :8000).
 
 ```sh
 # CLI alternatives:

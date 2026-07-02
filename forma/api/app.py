@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -40,7 +40,7 @@ from ..engines.precision import PrecisionEngine
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = ROOT / "runs"
-WEB_DIR = ROOT / "web"
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 RUNS_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="Forma", version="0.0.1")
@@ -178,9 +178,16 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
         worker_task.cancel()
 
 
-@app.get("/")
-def index():
-    return FileResponse(WEB_DIR / "index.html")
-
-
 app.mount("/runs", StaticFiles(directory=RUNS_DIR), name="runs")
+
+if FRONTEND_DIST.exists():
+    # production build of the React app (frontend/: `npm run build`)
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="app")
+else:
+    @app.get("/")
+    def index():
+        return JSONResponse(
+            {"detail": "frontend not built — run `npm run build` in frontend/, "
+                       "or use the Vite dev server (`npm run dev`)"},
+            status_code=503,
+        )
