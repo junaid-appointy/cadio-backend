@@ -27,12 +27,26 @@
   Tools = `run_cad` (execute+validate, returns measured facts) and `ask_user`
   (batched Q&A, defaults). System prompt = program contract + corpus seed
   (`agent/corpus.py`). CLI REPL: `python -m forma.cli chat`.
-- **API + playground** (`forma/api/app.py`, `web/index.html`): POST
-  `/api/execute`, GET `/api/runs`, artifacts served at `/runs/...`; three.js
-  STL viewer with editor, param overrides, validation report, run history.
+- **Web workspace — the primary surface** (`forma/api/app.py`, `web/index.html`):
+  three panes — chat / 3D viewer / tabbed side panel (Params · Code · Runs).
+  - **WebSocket `/ws/chat?model=`** runs the agent loop server-side; events to
+    the browser: `status` (thinking / building), `ask_user` (rendered as an
+    inline form; answers round-trip to the blocked agent thread via a queue),
+    `run` (persisted meta with artifact URLs + manifest; viewer and params
+    panel update live), `assistant`, `error`. Model picked per-connection from
+    the UI header.
+  - **Params tab**: manifest-driven sliders/number inputs; "Rebuild" POSTs the
+    run's own `program.py` + new values to `/api/execute` — **no LLM call**.
+  - **Code tab**: raw program editing + run. **Runs tab**: history, click to
+    reload any version. Exports (STL/STEP/GLB) top-right of the viewer.
+  - REST: `POST /api/execute`, `GET /api/runs`, `GET /api/config` (default
+    model + which provider keys the server sees), `GET /api/example`.
 
 **Verified 2026-07-02:** CLI run with overrides (200×60×30 box, validation OK);
 API execute → 200 with artifact URLs; viewer page + STL serving → 200.
+Websocket flow verified offline (mocked LLM + real engine): chat → ask_user
+form round-trip → run event (artifact URLs + manifest) → assistant reply, with
+the answered dimension (150mm) measured in the produced geometry.
 
 ## Next steps
 
@@ -42,8 +56,11 @@ API execute → 200 with artifact URLs; viewer page + STL serving → 200.
 - [ ] Checkpoint artifact: dimensioned 2D drawing before "done"
 - [ ] Docker sandbox (no-network, resource-limited) to replace subprocess v0
 - [ ] Versions as first-class records (tree, labels) instead of flat run dirs
-- [ ] Web chat panel (websocket) wiring the orchestrator into the playground
-- [ ] Manifest-driven sliders in the playground (render PARAMS as controls)
+- [x] Web chat panel (websocket) wiring the orchestrator into the workspace
+- [x] Manifest-driven sliders in the workspace (PARAMS rendered as controls)
+- [ ] Persist chat sessions (survive reload; today a reload starts a fresh
+      conversation while runs persist)
+- [ ] Image upload in web chat (reference photos → vision models)
 
 ## Build log
 

@@ -10,15 +10,15 @@ come from each provider's standard env var:
     xai/grok-4                     XAI_API_KEY
 
 Manual tool loop (OpenAI wire format, which LiteLLM normalizes every provider
-to) because the shell needs to own it: it persists every run as a version, and
-P1 will stream events to the web UI over a websocket.
+to) because the shell owns it: every run is persisted as a version, and the
+web UI receives live events (`on_event`) over a websocket.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -106,13 +106,22 @@ class Orchestrator:
         runs_root: Path,
         model: str | None = None,
         ask_user: Callable[[list[dict]], list[dict]] | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ):
         self.model = model or DEFAULT_MODEL
         self.engine = engine
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
+        self.on_event = on_event
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
+
+    def _emit(self, event: dict) -> None:
+        if self.on_event:
+            try:
+                self.on_event(event)
+            except Exception:
+                pass  # UI notification must never break the loop
 
     def _system_prompt(self) -> str:
         return (
@@ -129,11 +138,21 @@ class Orchestrator:
         if name == "ask_user":
             return json.dumps(self.ask_user(tool_input["questions"]))
         if name == "run_cad":
-            run_dir = self.runs_root / time.strftime("%Y%m%d-%H%M%S")
+            label = tool_input.get("label", "")
+            self._emit({"type": "status", "state": "running_cad", "label": label})
+            run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
             result = self.engine.execute(
                 tool_input["code"], tool_input.get("params"), run_dir
             )
             self.last_run_dir = run_dir
+            self._emit(
+                {
+                    "type": "run",
+                    "run_id": run_dir.name,
+                    "label": label,
+                    "result": result.to_dict(),
+                }
+            )
             payload = result.to_dict()
             # the agent needs facts + verdict, not file paths
             payload.pop("run_dir", None)
