@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Forma — playground</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #14161a; color: #d8dbe0; display: grid;
+         grid-template-columns: 460px 1fr; height: 100vh; }
+  #left { display: flex; flex-direction: column; border-right: 1px solid #2a2e35; min-width: 0; }
+  #left header { padding: 10px 14px; border-bottom: 1px solid #2a2e35; display: flex;
+                 align-items: baseline; gap: 10px; }
+  #left header h1 { font-size: 15px; margin: 0; color: #e8b34b; }
+  #left header span { color: #6b7280; font-size: 12px; }
+  #code { flex: 1; width: 100%; background: #101215; color: #d8dbe0; border: 0;
+          padding: 12px; resize: none; font: 12.5px/1.5 ui-monospace, Menlo, monospace; outline: none; }
+  #paramsRow { border-top: 1px solid #2a2e35; padding: 8px 12px; }
+  #params { width: 100%; background: #101215; color: #d8dbe0; border: 1px solid #2a2e35;
+            border-radius: 4px; padding: 6px 8px; font: 12px ui-monospace, Menlo, monospace; }
+  #actions { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid #2a2e35; align-items: center; }
+  button { background: #e8b34b; color: #14161a; border: 0; border-radius: 5px;
+           padding: 7px 16px; font-weight: 700; cursor: pointer; font-family: inherit; }
+  button:disabled { opacity: .5; cursor: wait; }
+  select { background: #101215; color: #d8dbe0; border: 1px solid #2a2e35; border-radius: 4px; padding: 6px; max-width: 200px; }
+  #report { max-height: 180px; overflow: auto; padding: 8px 12px; border-top: 1px solid #2a2e35;
+            font-size: 12px; white-space: pre-wrap; }
+  #report .ok { color: #7dcf85; } #report .err { color: #e06c75; } #report .dim { color: #6b7280; }
+  #viewer { position: relative; min-width: 0; }
+  #canvas { width: 100%; height: 100%; display: block; }
+  #dl { position: absolute; top: 10px; right: 12px; display: flex; gap: 10px; }
+  #dl a { color: #e8b34b; text-decoration: none; font-size: 12px; border: 1px solid #3a3325;
+          padding: 4px 10px; border-radius: 4px; background: #14161acc; }
+  label { color: #6b7280; font-size: 11px; display:block; margin-bottom: 3px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <header><h1>forma</h1><span>precision engine · build123d · v0</span></header>
+  <textarea id="code" spellcheck="false"></textarea>
+  <div id="paramsRow">
+    <label>parameter overrides (JSON, e.g. {"length": 200})</label>
+    <input id="params" value="{}" />
+  </div>
+  <div id="actions">
+    <button id="runBtn">Run ▸</button>
+    <select id="runs"><option value="">— previous runs —</option></select>
+  </div>
+  <div id="report"><span class="dim">Edit the program, then Run. STL/STEP export links appear top-right.</span></div>
+</div>
+<div id="viewer">
+  <canvas id="canvas"></canvas>
+  <div id="dl"></div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+const canvas = document.getElementById('canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14161a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x333344, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(1, 1, 2);
+scene.add(dir);
+const grid = new THREE.GridHelper(400, 40, 0x2a2e35, 0x1e2126);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+
+let mesh = null;
+function resize() {
+  const w = canvas.clientWidth || canvas.parentElement.clientWidth;
+  const h = canvas.clientHeight || canvas.parentElement.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(document.getElementById('viewer'));
+resize();
+camera.position.set(180, -180, 140);
+camera.up.set(0, 0, 1);
+
+(function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+
+function showSTL(url) {
+  new STLLoader().load(url, geo => {
+    if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+    geo.computeVertexNormals();
+    mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color: 0xe8b34b, metalness: 0.1, roughness: 0.6 }));
+    scene.add(mesh);
+    geo.computeBoundingSphere();
+    const c = geo.boundingSphere.center, r = geo.boundingSphere.radius;
+    controls.target.copy(c);
+    camera.position.set(c.x + r * 1.8, c.y - r * 1.8, c.z + r * 1.4);
+  });
+}
+
+const report = document.getElementById('report');
+const dl = document.getElementById('dl');
+const runsSel = document.getElementById('runs');
+
+function renderResult(meta) {
+  dl.innerHTML = '';
+  if (!meta.ok) {
+    report.innerHTML = `<span class="err">EXECUTION FAILED</span>\n${escapeHtml(meta.error || '')}`;
+    return;
+  }
+  const v = meta.validation || { ok: true, issues: [] };
+  const size = meta.bbox.size.map(x => x.toFixed(2)).join(' × ');
+  let html = `<span class="${v.ok ? 'ok' : 'err'}">validation: ${v.ok ? 'OK' : 'FAILED'}</span>`;
+  for (const i of (v.issues || [])) html += `\n<span class="err">[${i.severity}] ${i.code}: ${escapeHtml(i.message)}</span>`;
+  html += `\n<span class="dim">bbox ${size} mm · volume ${(meta.volume_mm3/1000).toFixed(1)} cm³</span>`;
+  html += `\n<span class="dim">params ${escapeHtml(JSON.stringify(meta.params))}</span>`;
+  report.innerHTML = html;
+  const urls = meta.artifact_urls || {};
+  for (const kind of ['stl', 'step', 'glb']) {
+    if (urls[kind]) {
+      const a = document.createElement('a');
+      a.href = urls[kind]; a.textContent = kind.toUpperCase(); a.download = '';
+      dl.appendChild(a);
+    }
+  }
+  if (urls.stl) showSTL(urls.stl);
+}
+
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function refreshRuns() {
+  const runs = await (await fetch('/api/runs')).json();
+  runsSel.innerHTML = '<option value="">— previous runs —</option>';
+  for (const r of runs) {
+    const o = document.createElement('option');
+    o.value = JSON.stringify(r);
+    o.textContent = `${r.run_id}${r.ok ? '' : ' ✗'}`;
+    runsSel.appendChild(o);
+  }
+}
+runsSel.onchange = () => { if (runsSel.value) renderResult(JSON.parse(runsSel.value)); };
+
+const runBtn = document.getElementById('runBtn');
+runBtn.onclick = async () => {
+  let params;
+  try { params = JSON.parse(document.getElementById('params').value || '{}'); }
+  catch { report.innerHTML = '<span class="err">parameter overrides are not valid JSON</span>'; return; }
+  runBtn.disabled = true; report.innerHTML = '<span class="dim">running…</span>';
+  try {
+    const res = await fetch('/api/execute', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: document.getElementById('code').value, params }),
+    });
+    renderResult(await res.json());
+    refreshRuns();
+  } catch (e) {
+    report.innerHTML = `<span class="err">request failed: ${escapeHtml(String(e))}</span>`;
+  } finally { runBtn.disabled = false; }
+};
+
+// boot: load example program + past runs
+(async () => {
+  const ex = await (await fetch('/api/example')).json();
+  document.getElementById('code').value = ex.code;
+  refreshRuns();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[project]
+name = "forma"
+version = "0.0.1"
+description = "AI-agent 3D design platform — generic shell + pluggable geometry engines"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "build123d",
+    "trimesh",
+    "manifold3d",
+    "numpy",
+    "fastapi",
+    "uvicorn[standard]",
+    "anthropic",
+    "pydantic",
+]
+
+[project.scripts]
+forma = "forma.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["forma*"]
