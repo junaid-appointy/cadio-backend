@@ -52,8 +52,8 @@ def cmd_run(args) -> int:
 def cmd_chat(args) -> int:
     from .agent.orchestrator import Orchestrator
 
-    orch = Orchestrator(PrecisionEngine(), RUNS_ROOT)
-    print("Forma agent. Describe the part you need. /quit to exit.\n")
+    orch = Orchestrator(PrecisionEngine(), RUNS_ROOT, model=args.model)
+    print(f"Forma agent ({orch.model}). Describe the part you need. /quit to exit.\n")
     while True:
         try:
             user = input("you> ").strip()
@@ -81,6 +81,11 @@ def main() -> int:
     p_run.set_defaults(func=cmd_run)
 
     p_chat = sub.add_parser("chat", help="interactive agent session")
+    p_chat.add_argument(
+        "--model",
+        help="LLM to drive the agent, LiteLLM format (default: $FORMA_MODEL or "
+        "anthropic/claude-opus-4-8; e.g. openai/gpt-5.2, gemini/gemini-3-pro, xai/grok-4)",
+    )
     p_chat.set_defaults(func=cmd_chat)
 
     args = parser.parse_args()

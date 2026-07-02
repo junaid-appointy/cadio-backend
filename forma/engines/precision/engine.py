@@ -57,7 +57,9 @@ class PrecisionEngine:
     def execute(
         self, code: str, params: dict[str, Any] | None, run_dir: Path
     ) -> ExecutionResult:
-        run_dir = Path(run_dir)
+        # absolute: the subprocess runs with cwd=run_dir, so relative paths
+        # passed to the runner would otherwise resolve inside themselves
+        run_dir = Path(run_dir).resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
         program_path = run_dir / "program.py"
         program_path.write_text(code)

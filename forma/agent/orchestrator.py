@@ -1,69 +1,85 @@
-"""The agent loop: Claude + tools -> validated parametric models.
+"""The agent loop: any LLM + tools -> validated parametric models.
 
-Manual tool-use loop (not the SDK tool runner) because the shell needs to own
-the loop: it persists every run as a version, and P1 will stream events to the
-web UI over a websocket.
+Provider-agnostic via LiteLLM: the same loop runs on Claude, GPT, Gemini,
+Grok, etc. Pick the model with FORMA_MODEL (or --model on the CLI); API keys
+come from each provider's standard env var:
+
+    anthropic/claude-opus-4-8      ANTHROPIC_API_KEY   (default)
+    openai/gpt-5.2                 OPENAI_API_KEY
+    gemini/gemini-3-pro            GEMINI_API_KEY
+    xai/grok-4                     XAI_API_KEY
+
+Manual tool loop (OpenAI wire format, which LiteLLM normalizes every provider
+to) because the shell needs to own it: it persists every run as a version, and
+P1 will stream events to the web UI over a websocket.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-import anthropic
+import litellm
 
 from .corpus import system_corpus
 from ..engines.base import Engine
 
-MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = os.environ.get("FORMA_MODEL", "anthropic/claude-opus-4-8")
 
 TOOLS = [
     {
-        "name": "run_cad",
-        "description": (
-            "Execute a precision-engine program (build123d Python, per the program "
-            "contract) in the sandbox. Returns measured bbox/volume and the "
-            "validation report. Use this to build and to self-check; fix any "
-            "validation errors before answering the user."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Complete program file content"},
-                "params": {
-                    "type": "object",
-                    "description": "Optional parameter overrides (name -> value)",
+        "type": "function",
+        "function": {
+            "name": "run_cad",
+            "description": (
+                "Execute a precision-engine program (build123d Python, per the program "
+                "contract) in the sandbox. Returns measured bbox/volume and the "
+                "validation report. Use this to build and to self-check; fix any "
+                "validation errors before answering the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Complete program file content"},
+                    "params": {
+                        "type": "object",
+                        "description": "Optional parameter overrides (name -> value)",
+                    },
+                    "label": {"type": "string", "description": "Short label for this version"},
                 },
-                "label": {"type": "string", "description": "Short label for this version"},
+                "required": ["code"],
             },
-            "required": ["code"],
         },
     },
     {
-        "name": "ask_user",
-        "description": (
-            "Ask the user clarifying questions (max 4 per call), each with a "
-            "suggested default. Use for dimensions, tolerances, materials — "
-            "anything the requirements need. Never guess numbers from photos."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string"},
-                            "default": {"type": "string"},
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user clarifying questions (max 4 per call), each with a "
+                "suggested default. Use for dimensions, tolerances, materials — "
+                "anything the requirements need. Never guess numbers from photos."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string"},
+                                "default": {"type": "string"},
+                            },
+                            "required": ["question"],
                         },
-                        "required": ["question"],
-                    },
-                }
+                    }
+                },
+                "required": ["questions"],
             },
-            "required": ["questions"],
         },
     },
 ]
@@ -88,9 +104,10 @@ class Orchestrator:
         self,
         engine: Engine,
         runs_root: Path,
+        model: str | None = None,
         ask_user: Callable[[list[dict]], list[dict]] | None = None,
     ):
-        self.client = anthropic.Anthropic()
+        self.model = model or DEFAULT_MODEL
         self.engine = engine
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
@@ -129,30 +146,41 @@ class Orchestrator:
         """One conversational turn: returns the agent's final text."""
         self.messages.append({"role": "user", "content": user_message})
         while True:
-            response = self.client.messages.create(
-                model=MODEL,
+            response = litellm.completion(
+                model=self.model,
                 max_tokens=16000,
-                thinking={"type": "adaptive"},
-                system=[{
-                    "type": "text",
-                    "text": self._system_prompt(),
-                    "cache_control": {"type": "ephemeral"},
-                }],
+                messages=[{"role": "system", "content": self._system_prompt()}]
+                + self.messages,
                 tools=TOOLS,
-                messages=self.messages,
             )
-            self.messages.append({"role": "assistant", "content": response.content})
+            msg = response.choices[0].message
+            tool_calls = msg.tool_calls or []
 
-            if response.stop_reason != "tool_use":
-                return next(
-                    (b.text for b in response.content if b.type == "text"), ""
+            assistant: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+            if tool_calls:
+                assistant["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+            self.messages.append(assistant)
+
+            if not tool_calls:
+                return msg.content or ""
+
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError as exc:
+                    output = json.dumps({"error": f"invalid tool arguments: {exc}"})
+                else:
+                    output = self._handle_tool(tc.function.name, args)
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": output}
                 )
-
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    output = self._handle_tool(block.name, block.input)
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                    )
-            self.messages.append({"role": "user", "content": tool_results})

@@ -10,7 +10,7 @@ dependencies = [
     "numpy",
     "fastapi",
     "uvicorn[standard]",
-    "anthropic",
+    "litellm",
     "pydantic",
 ]
 

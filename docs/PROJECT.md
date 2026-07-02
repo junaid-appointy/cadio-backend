@@ -19,11 +19,14 @@
 - **Program contract:** `PARAMS` list (name/default/min/max/unit/group) +
   `build(params) -> Part`; requirement asserts inside `build()`. Slider
   re-execution never calls the LLM.
-- **Agent** (`forma/agent/orchestrator.py`): Claude `claude-opus-4-8`, adaptive
-  thinking, manual tool loop, tools = `run_cad` (execute+validate, returns
-  measured facts) and `ask_user` (batched Q&A, defaults). System prompt =
-  program contract + corpus seed (`agent/corpus.py`, from the socket-enclosure
-  learnings). CLI REPL: `python -m forma.cli chat`.
+- **Agent** (`forma/agent/orchestrator.py`): **provider-agnostic via LiteLLM**
+  — one OpenAI-format tool loop runs on Anthropic, OpenAI, Gemini, xAI/Grok,
+  etc. Model from `FORMA_MODEL` env or `chat --model provider/model-id`
+  (default `anthropic/claude-opus-4-8`); keys from each provider's standard
+  env var (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY).
+  Tools = `run_cad` (execute+validate, returns measured facts) and `ask_user`
+  (batched Q&A, defaults). System prompt = program contract + corpus seed
+  (`agent/corpus.py`). CLI REPL: `python -m forma.cli chat`.
 - **API + playground** (`forma/api/app.py`, `web/index.html`): POST
   `/api/execute`, GET `/api/runs`, artifacts served at `/runs/...`; three.js
   STL viewer with editor, param overrides, validation report, run history.
@@ -43,6 +46,13 @@ API execute → 200 with artifact URLs; viewer page + STL serving → 200.
 - [ ] Manifest-driven sliders in the playground (render PARAMS as controls)
 
 ## Build log
+
+**2026-07-02 — agent made provider-agnostic.** Orchestrator moved from the
+Anthropic SDK to LiteLLM (OpenAI wire format for messages/tool calls) so any
+API key works. Verified offline with a mocked LLM driving the real engine
+through a full tool round-trip. Fixed a bug found by that test: relative
+`run_dir` + subprocess `cwd=run_dir` made the runner write results into a
+nested path — engine now resolves `run_dir` to absolute.
 
 **2026-07-02 — repo bootstrapped.** uv + Python 3.12 venv; deps: build123d,
 trimesh, manifold3d, fastapi, uvicorn, anthropic. Wrote engine contract,

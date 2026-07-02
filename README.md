@@ -28,9 +28,16 @@ uv pip install -e .
 # Web playground: editor + params + 3D viewer + validation report
 .venv/bin/uvicorn forma.api.app:app --reload    # → http://127.0.0.1:8000
 
-# Agent REPL (needs ANTHROPIC_API_KEY or `ant auth login`)
-.venv/bin/python -m forma.cli chat
+# Agent REPL — bring any provider's key (Anthropic, OpenAI, Gemini, xAI/Grok, …)
+export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY
+.venv/bin/python -m forma.cli chat                       # default: anthropic/claude-opus-4-8
+.venv/bin/python -m forma.cli chat --model openai/gpt-5.2
+.venv/bin/python -m forma.cli chat --model gemini/gemini-3-pro
+.venv/bin/python -m forma.cli chat --model xai/grok-4
 ```
+
+The agent is provider-agnostic (LiteLLM): set `FORMA_MODEL` or pass `--model`
+in `provider/model-id` form; the matching provider env-var key is used.
 
 ## Layout
 
