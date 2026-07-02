@@ -31,13 +31,19 @@ uv pip install -e .
 # Agent REPL — bring any provider's key (Anthropic, OpenAI, Gemini, xAI/Grok, …)
 export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY
 .venv/bin/python -m forma.cli chat                       # default: anthropic/claude-opus-4-8
-.venv/bin/python -m forma.cli chat --model openai/gpt-5.2
-.venv/bin/python -m forma.cli chat --model gemini/gemini-3-pro
-.venv/bin/python -m forma.cli chat --model xai/grok-4
+.venv/bin/python -m forma.cli chat --model gemini/gemini-2.5-pro
 ```
 
 The agent is provider-agnostic (LiteLLM): set `FORMA_MODEL` or pass `--model`
-in `provider/model-id` form; the matching provider env-var key is used.
+as `provider/model-id`, using the **exact model id your provider serves** —
+a wrong id 404s. To list what your key can access:
+
+```sh
+# Gemini (AI Studio key)
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" | grep '"name"'
+# OpenAI
+curl -s https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY" | grep '"id"'
+```
 
 ## Layout
 

@@ -63,7 +63,16 @@ def cmd_chat(args) -> int:
             continue
         if user in ("/quit", "/exit"):
             return 0
-        reply = orch.send(user)
+        try:
+            reply = orch.send(user)
+        except Exception as exc:  # bad model id, auth, rate limit — keep the REPL alive
+            print(f"\n[error] {type(exc).__name__}: {exc}\n", file=sys.stderr)
+            print("Check the model id and API key (e.g. --model gemini/gemini-2.5-pro).\n",
+                  file=sys.stderr)
+            # drop the failed user turn so history stays consistent
+            if orch.messages and orch.messages[-1].get("role") == "user":
+                orch.messages.pop()
+            continue
         print(f"\nforma> {reply}\n")
         if orch.last_run_dir:
             print(f"(latest artifacts in {orch.last_run_dir})\n")
