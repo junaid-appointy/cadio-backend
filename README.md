@@ -21,12 +21,22 @@ uv pip install -e .
 
 ## Use
 
-```sh
-# Run a program with parameter overrides, get validated STL/STEP/GLB
-.venv/bin/python -m forma.cli run examples/simple_box.py --set length=200 --set wall=3
+**Web workspace (primary):** export your provider key first, then
 
-# Web playground: editor + params + 3D viewer + validation report
-.venv/bin/uvicorn forma.api.app:app --reload    # → http://127.0.0.1:8000
+```sh
+export GEMINI_API_KEY=...    # or ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY
+.venv/bin/uvicorn forma.api.app:app            # → http://127.0.0.1:8000
+```
+
+Chat with the agent on the left (it asks clarifying questions as inline
+forms), watch the model appear in the 3D viewer, tweak dimensions with the
+Params sliders (rebuilds without the LLM), edit raw code in the Code tab,
+reload old versions from Runs, export STL/STEP/GLB top-right. Set the model id
+in the header (LiteLLM format, e.g. `gemini/gemini-2.5-pro`) and hit connect.
+
+```sh
+# CLI alternatives:
+.venv/bin/python -m forma.cli run examples/simple_box.py --set length=200 --set wall=3
 
 # Agent REPL — bring any provider's key (Anthropic, OpenAI, Gemini, xAI/Grok, …)
 export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY
