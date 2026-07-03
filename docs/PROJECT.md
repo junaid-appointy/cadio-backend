@@ -77,6 +77,18 @@ provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
 
 ## Build log
 
+**2026-07-03 — 1.3 design pass + critical /assets shadowing fix.**
+Design system (layered surfaces, sans UI type + mono for technical values,
+tokens, transitions, styled scrollbars); top app bar (wordmark, connection
+badge, model chip); resizable panes (react-resizable-panels v3: Group/Panel/
+Separator API); markdown rendering for agent messages (react-markdown);
+toasts; per-pane error boundaries; welcome/empty states everywhere; animated
+thinking dots. **Playwright visual check caught a real breakage:** the
+reference-image mount at `/assets` shadowed Vite's built bundle (also under
+`/assets/*`) → blank page. Uploads now serve from `/refs/` (urls derived from
+filenames at read time, so old metas remap automatically). Screenshot pixel
+check confirms the dark theme renders as designed.
+
 **2026-07-03 — image references + disconnect fix + auto-reconnect.**
 - **Root-caused the mid-conversation disconnects:** `uvicorn --reload` watches
   the whole repo, so the engine writing `runs/*/program.py` triggered a server
@@ -131,6 +143,13 @@ orchestrator, CLI, FastAPI app, three.js playground, example program. Vertical
 slice verified end to end (CLI + API + viewer).
 
 ## Learnings & gotchas
+
+- **Never mount user content at `/assets`** — Vite emits the app bundle under
+  `/assets/*`; an earlier static mount silently shadows it and the page goes
+  blank with only 404s in the console. Reference uploads live at `/refs/`.
+- **API-level tests can't catch route-shadowing/visual breakage** — the
+  Playwright screenshot check (frontend devDependency) is what found it; keep
+  using it after frontend-affecting backend changes.
 
 - **First OCCT load can exceed 90s on macOS** — Gatekeeper verifies the ~300MB
   OCP dylib once per install. Looks like a sandbox hang; it isn't. Subsequent

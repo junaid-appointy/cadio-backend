@@ -78,7 +78,7 @@ wow + usefulness win.
 (sub-second updates), nothing queues up, and Runs history contains only
 explicitly saved versions.
 
-### 1.3 App shell & design pass
+### 1.3 App shell & design pass  ✅ done 2026-07-03
 **What:** Resizable panes (drag dividers between chat/viewer/side panel),
 toast notifications for errors/success, proper empty states, loading
 skeletons, consistent spacing/typography scale, header with app name +

@@ -150,9 +150,12 @@ def example_program():
 
 def _asset_meta(meta_file: Path) -> dict | None:
     try:
-        return json.loads(meta_file.read_text())
+        meta = json.loads(meta_file.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    # url derived from the filename, not trusted from disk (and the mount can move)
+    meta["url"] = f"/refs/{meta['file']}"
+    return meta
 
 
 @app.post("/api/assets")
@@ -172,7 +175,9 @@ async def upload_asset(file: UploadFile):
     meta = {
         "id": asset_id,
         "file": f"{asset_id}{ext}",
-        "url": f"/assets/{asset_id}{ext}",
+        # /refs, NOT /assets — Vite's built bundle owns /assets/* under the
+        # root mount, and shadowing it blanks the whole UI
+        "url": f"/refs/{asset_id}{ext}",
         "name": Path(file.filename or "image").name[:80],
         "mime": mime,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -300,7 +305,7 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
 
 
 app.mount("/runs", StaticFiles(directory=RUNS_DIR), name="runs")
-app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+app.mount("/refs", StaticFiles(directory=ASSETS_DIR), name="refs")
 
 if FRONTEND_DIST.exists():
     # production build of the React app (frontend/: `npm run build`)
