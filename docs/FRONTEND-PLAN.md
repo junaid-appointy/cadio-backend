@@ -21,7 +21,7 @@
 
 ## Phase 1 — the two asks + the foundation
 
-### 1.1 Provider & API key management in the UI  ⬅ first
+### 1.1 Provider & API key management in the UI  ✅ done 2026-07-03
 **What:** A settings surface (gear icon → slide-over) with: provider select
 (Anthropic / OpenAI / Gemini / xAI / custom LiteLLM string), API key input
 (password field, show/hide), model picker populated from the provider's own
@@ -51,7 +51,7 @@ single-provider.
 **Done when:** with zero env vars set, a fresh browser can pick Gemini, paste
 a key, see the real model list, and complete an agent build.
 
-### 1.2 Realtime manual tweaks
+### 1.2 Realtime manual tweaks  ✅ done 2026-07-03 (warm preview ≈20ms engine / ≈25ms HTTP)
 **What:** Dragging a param slider updates the 3D model live — no Apply button.
 
 **Why:** This is the "parametric" promise made tangible; the single biggest

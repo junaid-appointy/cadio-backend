@@ -11,9 +11,14 @@
   -> ExecutionResult` (manifest, artifacts, measured bbox/volume, validation).
   Engines are plugins; the shell never imports engine internals.
 - **Engine 1 — precision** (`forma/engines/precision/`): build123d 0.11 /
-  OCCT on Python 3.12 (`uv venv .venv`). Sandbox v0 = subprocess `python -I`,
-  stripped env (PATH/HOME/TMPDIR → run dir), 90s wall clock, per-run output
-  dir. Exports STL + STEP; GLB derived via trimesh for the viewer.
+  OCCT on Python 3.12 (`uv venv .venv`). **Warm worker pool** (`pool.py`):
+  resident `python -I` workers with the kernel pre-imported serve jobs over
+  stdio — rebuilds ≈20ms vs ≈6s cold; workers are replaced on death/timeout
+  and a one-shot cold subprocess remains as fallback. Persistent sandbox HOME
+  (`.sandbox_home/`) keeps OCCT caches warm. `preview=True` skips STEP + GLB.
+  Stripped env, 90s wall clock, per-run output dir. Known caveat: a worker
+  serves many jobs, so a hostile program could poison its own worker —
+  superseded by the Docker sandbox (P1).
 - **Validation gate v1** (`forma/validation/mesh.py`): watertight, winding,
   positive volume, mesh-bbox vs BREP-bbox cross-check (catches export bugs).
 - **Program contract:** `PARAMS` list (name/default/min/max/unit/group) +
@@ -71,6 +76,20 @@ provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
 - [ ] Image upload in web chat (reference photos → vision models)
 
 ## Build log
+
+**2026-07-03 — frontend plan items 1.1 + 1.2 landed.**
+(1.1) Provider & API key live in the UI: settings slide-over with provider
+select, per-provider key storage (localStorage), live model list fetched from
+the provider's own API (`POST /api/providers/models` — doubles as the key
+test), model filter. Keys travel per-connection in the ws `init` message
+(never query strings / never persisted server-side); orchestrator passes
+`api_key` through to LiteLLM; env vars remain a fallback.
+(1.2) Realtime tweaks: warm worker pool + `preview: true` execute path
+(STL-only, `runs/_preview/` scratch slots pruned to 12, excluded from
+history); frontend debounces (120ms) + coalesces slider changes to at most
+one in-flight preview; viewer swaps meshes without flicker and only re-frames
+the camera on saved runs. Params panel gains Save version (label), reset, and
+per-param dirty dots. Measured: engine preview ≈20ms, HTTP round-trip ≈25ms.
 
 **2026-07-02 — frontend moved to React + Vite + TypeScript.** The v0 single
 vanilla-JS HTML file (chosen to keep the slice build-tool-free) is replaced by

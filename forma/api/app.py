@@ -31,7 +31,9 @@ import asyncio
 import json
 import os
 import queue
+import shutil
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -56,6 +58,18 @@ class ExecuteRequest(BaseModel):
     code: str
     params: dict | None = None
     label: str | None = None
+    preview: bool = False  # fast path: no STEP/GLB, no history entry
+
+
+PREVIEW_DIR = RUNS_DIR / "_preview"
+
+
+def _prune_previews(keep: int = 12) -> None:
+    if not PREVIEW_DIR.exists():
+        return
+    dirs = sorted(PREVIEW_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in dirs[keep:]:
+        shutil.rmtree(stale, ignore_errors=True)
 
 
 def _persist_meta(run_id: str, result_dict: dict, label: str = "") -> dict:
@@ -79,10 +93,27 @@ def _persist_meta(run_id: str, result_dict: dict, label: str = "") -> dict:
 
 @app.post("/api/execute")
 def execute(req: ExecuteRequest):
+    if req.preview:
+        run_id = f"_preview/{uuid.uuid4().hex[:12]}"
+        result = engine.execute(req.code, req.params, RUNS_DIR / run_id, preview=True)
+        meta = result.to_dict()
+        meta.pop("run_dir", None)
+        meta["run_id"] = run_id
+        meta["label"] = ""
+        meta["preview"] = True
+        if result.ok:
+            meta["artifact_urls"] = _artifact_urls_for(run_id, result.artifacts)
+        _prune_previews()
+        return JSONResponse(meta, status_code=200 if result.ok else 422)
+
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time()*1000)%1000:03d}"
     result = engine.execute(req.code, req.params, RUNS_DIR / run_id)
     meta = _persist_meta(run_id, result.to_dict(), req.label or "")
     return JSONResponse(meta, status_code=200 if result.ok else 422)
+
+
+def _artifact_urls_for(run_id: str, artifacts: dict) -> dict[str, str]:
+    return {kind: f"/runs/{run_id}/{Path(p).name}" for kind, p in artifacts.items()}
 
 
 @app.get("/api/runs")
