@@ -20,6 +20,7 @@ import base64
 import json
 import mimetypes
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -119,6 +120,12 @@ class Orchestrator:
         self.on_event = on_event
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
+        self._stop = threading.Event()
+
+    def request_stop(self) -> None:
+        """Cooperative cancel: takes effect between LLM calls / tool runs.
+        Pending tool calls get a 'cancelled' result so history stays valid."""
+        self._stop.set()
 
     def _emit(self, event: dict) -> None:
         if self.on_event:
@@ -183,7 +190,10 @@ class Orchestrator:
         else:
             content = user_message
         self.messages.append({"role": "user", "content": content})
+        self._stop.clear()
         while True:
+            if self._stop.is_set():
+                return "⏹ Stopped."
             extra = {"api_key": self.api_key} if self.api_key else {}
             response = litellm.completion(
                 model=self.model,
@@ -215,12 +225,15 @@ class Orchestrator:
                 return msg.content or ""
 
             for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError as exc:
-                    output = json.dumps({"error": f"invalid tool arguments: {exc}"})
+                if self._stop.is_set():
+                    output = json.dumps({"cancelled": "the user stopped this turn"})
                 else:
-                    output = self._handle_tool(tc.function.name, args)
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError as exc:
+                        output = json.dumps({"error": f"invalid tool arguments: {exc}"})
+                    else:
+                        output = self._handle_tool(tc.function.name, args)
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": output}
                 )

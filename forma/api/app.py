@@ -227,6 +227,7 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
     answers_q: queue.Queue = queue.Queue()  # browser answers -> agent thread
     chat_q: asyncio.Queue = asyncio.Queue()  # user messages -> worker
     closed = False
+    ask_pending = False  # an ask_user form is waiting on the browser
 
     def send_threadsafe(payload: dict) -> None:
         if closed:
@@ -237,8 +238,13 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
             pass
 
     def ask_user(questions: list[dict]) -> list[dict]:
+        nonlocal ask_pending
         send_threadsafe({"type": "ask_user", "questions": questions})
-        answers = answers_q.get()  # blocks the agent thread until the form comes back
+        ask_pending = True
+        try:
+            answers = answers_q.get()  # blocks the agent thread until the form comes back
+        finally:
+            ask_pending = False
         return answers if answers is not None else []
 
     def on_event(event: dict) -> None:
@@ -294,6 +300,11 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
                 chat_q.put_nowait((data["text"], images))
             elif kind == "answers":
                 answers_q.put(data.get("answers", []))
+            elif kind == "stop":
+                if orch is not None:
+                    orch.request_stop()
+                if ask_pending:
+                    answers_q.put(None)  # unblock the thread waiting on a form
     except WebSocketDisconnect:
         pass
     finally:
