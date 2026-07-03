@@ -111,6 +111,7 @@ class Orchestrator:
         api_key: str | None = None,
         ask_user: Callable[[list[dict]], list[dict]] | None = None,
         on_event: Callable[[dict], None] | None = None,
+        on_message: Callable[[str, dict], None] | None = None,
     ):
         self.model = model or DEFAULT_MODEL
         self.api_key = api_key or None  # falls back to provider env vars
@@ -118,9 +119,25 @@ class Orchestrator:
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
         self.on_event = on_event
+        # on_message(role, record): fired as each message is appended, in a
+        # base64-free persistence shape (see forma/api/history.py). Lets the
+        # shell write conversation history to the DB in real time.
+        self.on_message = on_message
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
         self._stop = threading.Event()
+
+    def set_history(self, messages: list[dict[str, Any]]) -> None:
+        """Restore prior conversation (LLM format) so a resumed session
+        genuinely remembers. Does not re-fire on_message."""
+        self.messages = list(messages)
+
+    def _persist(self, role: str, record: dict) -> None:
+        if self.on_message:
+            try:
+                self.on_message(role, record)
+            except Exception:
+                pass  # persistence must never break the agent loop
 
     def request_stop(self) -> None:
         """Cooperative cancel: takes effect between LLM calls / tool runs.
@@ -180,16 +197,19 @@ class Orchestrator:
         # vision-capable model)
         return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
-    def send(self, user_message: str, images: list[Path] | None = None) -> str:
+    def send(self, user_message: str, images: list[dict] | None = None) -> str:
         """One conversational turn: returns the agent's final text.
-        `images` are reference photos — shape/topology only; the corpus rules
-        forbid the agent from reading dimensions off them."""
+        `images` are reference photos as {"id","path"} — shape/topology only;
+        the corpus rules forbid the agent from reading dimensions off them."""
         if images:
             content: Any = [{"type": "text", "text": user_message}]
-            content += [self._image_block(Path(p)) for p in images]
+            content += [self._image_block(Path(img["path"])) for img in images]
         else:
             content = user_message
         self.messages.append({"role": "user", "content": content})
+        # persisted base64-free: text + asset ids (re-embedded on replay)
+        self._persist("user", {"text": user_message,
+                               "image_asset_ids": [img["id"] for img in (images or [])]})
         self._stop.clear()
         while True:
             if self._stop.is_set():
@@ -220,6 +240,8 @@ class Orchestrator:
                     for tc in tool_calls
                 ]
             self.messages.append(assistant)
+            self._persist("assistant", {"content": assistant["content"],
+                                        "tool_calls": assistant.get("tool_calls")})
 
             if not tool_calls:
                 return msg.content or ""
@@ -237,3 +259,4 @@ class Orchestrator:
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": output}
                 )
+                self._persist("tool", {"tool_call_id": tc.id, "content": output})

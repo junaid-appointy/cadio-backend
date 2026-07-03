@@ -1,9 +1,18 @@
 """Runtime data locations.
 
-Everything Forma writes at runtime (runs, previews, uploaded references,
-sandbox caches) lives OUTSIDE the repo, under ~/.forma (override with
-FORMA_HOME). This is load-bearing: dev servers watch the repo for changes,
-and any runtime write inside it restarts the server mid-conversation.
+Everything Forma writes at runtime (the project database, run artifacts,
+uploaded references, sandbox caches) lives OUTSIDE the repo, under ~/.forma
+(override with FORMA_HOME). This is load-bearing: dev servers watch the repo
+for changes, and any runtime write inside it restarts the server
+mid-conversation.
+
+Layout (Track A):
+  ~/.forma/
+    forma.db                       SQLite: projects, messages, runs, assets
+    projects/<pid>/runs/<run_id>/  run artifacts (stl/step/glb/program.py)
+    projects/<pid>/refs/<file>     uploaded reference images
+    previews/                      ephemeral slider-preview scratch (global)
+    sandbox_home/                  OCCT caches (warm workers)
 """
 
 from __future__ import annotations
@@ -15,12 +24,29 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DATA_DIR = Path(os.environ.get("FORMA_HOME", Path.home() / ".forma"))
-RUNS_DIR = DATA_DIR / "runs"
-ASSETS_DIR = DATA_DIR / "assets"
+DB_PATH = DATA_DIR / "forma.db"
+PROJECTS_DIR = DATA_DIR / "projects"
+PREVIEW_DIR = DATA_DIR / "previews"
 SANDBOX_HOME = DATA_DIR / "sandbox_home"
 
+# legacy flat dirs (pre-Track-A); kept only so the store can migrate them
+LEGACY_RUNS_DIR = DATA_DIR / "runs"
+LEGACY_ASSETS_DIR = DATA_DIR / "assets"
 
-def _migrate_legacy(old: Path, new: Path) -> None:
+
+def project_dir(pid: str) -> Path:
+    return PROJECTS_DIR / pid
+
+
+def project_runs_dir(pid: str) -> Path:
+    return PROJECTS_DIR / pid / "runs"
+
+
+def project_refs_dir(pid: str) -> Path:
+    return PROJECTS_DIR / pid / "refs"
+
+
+def _migrate_repo_leftover(old: Path, new: Path) -> None:
     """One-time move of pre-~/.forma data written inside the repo."""
     if not old.is_dir() or new.exists():
         return
@@ -31,9 +57,10 @@ def _migrate_legacy(old: Path, new: Path) -> None:
         pass  # cross-device or permission issue — start fresh instead
 
 
-_migrate_legacy(REPO_ROOT / "runs", RUNS_DIR)
-_migrate_legacy(REPO_ROOT / "assets", ASSETS_DIR)
-_migrate_legacy(REPO_ROOT / ".sandbox_home", SANDBOX_HOME)
+# pull any data still sitting in the repo out to ~/.forma (older installs)
+_migrate_repo_leftover(REPO_ROOT / "runs", LEGACY_RUNS_DIR)
+_migrate_repo_leftover(REPO_ROOT / "assets", LEGACY_ASSETS_DIR)
+_migrate_repo_leftover(REPO_ROOT / ".sandbox_home", SANDBOX_HOME)
 
-for _d in (RUNS_DIR, ASSETS_DIR, SANDBOX_HOME):
+for _d in (PROJECTS_DIR, PREVIEW_DIR, SANDBOX_HOME):
     _d.mkdir(parents=True, exist_ok=True)
