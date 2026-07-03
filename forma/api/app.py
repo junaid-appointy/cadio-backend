@@ -55,8 +55,10 @@ from .providers import ProviderError, list_models
 ROOT = config.REPO_ROOT
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 
-ASSET_MAX_BYTES = 15 * 1024 * 1024
-ASSET_MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+ASSET_MAX_BYTES = 40 * 1024 * 1024
+IMAGE_MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+# reference geometry: agent measures these with inspect_geometry (not shown as images)
+GEOMETRY_EXTS = {".step": "model/step", ".stp": "model/step", ".stl": "model/stl"}
 
 app = FastAPI(title="Forma", version="0.1.0")
 engine = PrecisionEngine()
@@ -220,17 +222,25 @@ async def upload_asset(pid: str, file: UploadFile):
     if not store.get_project(pid):
         return JSONResponse({"error": "project not found"}, status_code=404)
     mime = file.content_type or ""
-    if mime not in ASSET_MIMES:
-        return JSONResponse({"error": f"unsupported type {mime!r} — upload an image"}, status_code=400)
+    ext = Path(file.filename or "").suffix.lower()
+    # images by mime; reference geometry by extension (STEP/STL mimes are unreliable)
+    if mime in IMAGE_MIMES:
+        store_ext, store_mime = IMAGE_MIMES[mime], mime
+    elif ext in GEOMETRY_EXTS:
+        store_ext, store_mime = ext, GEOMETRY_EXTS[ext]
+    else:
+        return JSONResponse(
+            {"error": "unsupported file — upload an image (PNG/JPG/WEBP/GIF) or geometry (STEP/STL)"},
+            status_code=400)
     data = await file.read()
     if len(data) > ASSET_MAX_BYTES:
-        return JSONResponse({"error": "image larger than 15MB"}, status_code=400)
+        return JSONResponse({"error": "file larger than 40MB"}, status_code=400)
     asset_id = uuid.uuid4().hex[:12]
-    fname = f"{asset_id}{ASSET_MIMES[mime]}"
+    fname = f"{asset_id}{store_ext}"
     config.project_refs_dir(pid).mkdir(parents=True, exist_ok=True)
     (config.project_refs_dir(pid) / fname).write_bytes(data)
-    name = Path(file.filename or "image").name[:80]
-    return store.add_asset(pid, asset_id, fname, name, mime)
+    name = Path(file.filename or "file").name[:80]
+    return store.add_asset(pid, asset_id, fname, name, store_mime)
 
 
 # ---- providers ------------------------------------------------------------
@@ -302,9 +312,17 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
         p = config.project_refs_dir(pid) / a["file"]
         return p if p.exists() else None
 
+    def inspect_asset(aid: str) -> dict:
+        from ..engines.precision.inspect import inspect_geometry
+        p = asset_path(aid)
+        if not p:
+            return {"error": f"no such reference geometry: {aid!r}"}
+        return inspect_geometry(p)
+
     orch = Orchestrator(
         engine, config.project_runs_dir(pid),
         ask_user=ask_user, on_event=on_event, on_message=on_message,
+        inspect_asset=inspect_asset,
     )
     # rebuild the agent's memory from stored history (resume)
     records = store.get_messages(pid)
@@ -341,8 +359,13 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
                 orch.api_key = data.get("api_key") or None
                 await ws.send_json({"type": "ready", "model": orch.model})
             elif kind == "chat" and data.get("text", "").strip():
-                images = _resolve_assets(pid, data.get("assets") or [])
-                chat_q.put_nowait((data["text"], images))
+                images, geometry = _split_assets(pid, data.get("assets") or [])
+                text = data["text"]
+                if geometry:  # tell the agent the ids so it can inspect_geometry
+                    lines = "\n".join(f"- id={g['id']} ({g['name']})" for g in geometry)
+                    text += ("\n\n[Reference geometry attached — measure with "
+                             f"inspect_geometry before asking for known dimensions:\n{lines}]")
+                chat_q.put_nowait((text, images))
             elif kind == "answers":
                 answers_q.put(data.get("answers", []))
             elif kind == "stop":
@@ -357,9 +380,10 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
         worker_task.cancel()
 
 
-def _resolve_assets(pid: str, asset_ids: list) -> list[dict]:
-    """ids -> [{id, path}], rejecting anything that isn't a known asset id."""
-    out = []
+def _split_assets(pid: str, asset_ids: list) -> tuple[list[dict], list[dict]]:
+    """ids -> (image attachments [{id,path}], geometry attachments [{id,name}]).
+    Images ride the message as vision blocks; geometry is inspected on request."""
+    images, geometry = [], []
     for aid in asset_ids[:8]:
         if not (isinstance(aid, str) and aid.isalnum()):
             continue
@@ -367,9 +391,13 @@ def _resolve_assets(pid: str, asset_ids: list) -> list[dict]:
         if not a:
             continue
         p = config.project_refs_dir(pid) / a["file"]
-        if p.exists():
-            out.append({"id": aid, "path": str(p)})
-    return out
+        if not p.exists():
+            continue
+        if a["mime"].startswith("image/"):
+            images.append({"id": aid, "path": str(p)})
+        else:
+            geometry.append({"id": aid, "name": a["name"]})
+    return images, geometry
 
 
 # ---- static mounts --------------------------------------------------------

@@ -60,6 +60,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "inspect_geometry",
+            "description": (
+                "Measure an uploaded reference solid (STEP/STL) the user attached. "
+                "Returns its bounding box, volume, and (for STEP) cylindrical "
+                "hole/boss diameters — real numbers to build a matching or mating "
+                "part from ('make a lid for this'). Call it before asking the user "
+                "for dimensions that the reference already defines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "description": "id of the attached geometry asset"},
+                },
+                "required": ["asset_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_user",
             "description": (
                 "Ask the user clarifying questions (max 4 per call), each with a "
@@ -112,12 +132,14 @@ class Orchestrator:
         ask_user: Callable[[list[dict]], list[dict]] | None = None,
         on_event: Callable[[dict], None] | None = None,
         on_message: Callable[[str, dict], None] | None = None,
+        inspect_asset: Callable[[str], dict] | None = None,
     ):
         self.model = model or DEFAULT_MODEL
         self.api_key = api_key or None  # falls back to provider env vars
         self.engine = engine
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
+        self.inspect_asset = inspect_asset
         self.on_event = on_event
         # on_message(role, record): fired as each message is appended, in a
         # base64-free persistence shape (see forma/api/history.py). Lets the
@@ -125,7 +147,14 @@ class Orchestrator:
         self.on_message = on_message
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
+        self._turn_renders: list[Path] = []  # renders from the current turn's builds
         self._stop = threading.Event()
+
+    def _supports_vision(self) -> bool:
+        try:
+            return bool(litellm.supports_vision(model=self.model))
+        except Exception:
+            return False
 
     def set_history(self, messages: list[dict[str, Any]]) -> None:
         """Restore prior conversation (LLM format) so a resumed session
@@ -165,6 +194,10 @@ class Orchestrator:
     def _handle_tool(self, name: str, tool_input: dict) -> str:
         if name == "ask_user":
             return json.dumps(self.ask_user(tool_input["questions"]))
+        if name == "inspect_geometry":
+            if not self.inspect_asset:
+                return json.dumps({"error": "geometry inspection unavailable"})
+            return json.dumps(self.inspect_asset(tool_input.get("asset_id", "")))
         if name == "run_cad":
             label = tool_input.get("label", "")
             self._emit({"type": "status", "state": "running_cad", "label": label})
@@ -181,9 +214,13 @@ class Orchestrator:
                     "result": result.to_dict(),
                 }
             )
+            # queue renders so the agent can SEE this build (flushed after the
+            # tool result, as a vision user-message — see send()).
+            if result.ok and result.renders:
+                self._turn_renders = [Path(p) for p in result.renders.values()]
             payload = result.to_dict()
-            # the agent needs facts + verdict, not file paths
-            payload.pop("run_dir", None)
+            payload.pop("run_dir", None)      # the agent needs facts, not paths
+            payload.pop("renders", None)      # shown as images, not JSON
             if result.ok:
                 payload["artifacts"] = sorted(result.artifacts)
             return json.dumps(payload)
@@ -210,6 +247,7 @@ class Orchestrator:
         # persisted base64-free: text + asset ids (re-embedded on replay)
         self._persist("user", {"text": user_message,
                                "image_asset_ids": [img["id"] for img in (images or [])]})
+        self._turn_renders = []
         self._stop.clear()
         while True:
             if self._stop.is_set():
@@ -260,3 +298,23 @@ class Orchestrator:
                     {"role": "tool", "tool_call_id": tc.id, "content": output}
                 )
                 self._persist("tool", {"tool_call_id": tc.id, "content": output})
+
+            # Show the agent what it just built. Tool messages are text-only in
+            # the OpenAI schema, so renders ride in a following user message.
+            # NOT persisted: transient in-turn guidance; the agent's resulting
+            # critique/fix (assistant messages) is what's worth replaying.
+            if self._turn_renders and self._supports_vision():
+                blocks: list[Any] = [{
+                    "type": "text",
+                    "text": ("Renders of the model you just built (iso / front / top / right). "
+                             "Look at them: does the SHAPE match the requirement and any "
+                             "reference images? If proportions, features, or form are wrong, "
+                             "fix the program and rebuild before replying to the user."),
+                }]
+                for p in self._turn_renders:
+                    try:
+                        blocks.append(self._image_block(p))
+                    except OSError:
+                        pass
+                self.messages.append({"role": "user", "content": blocks})
+            self._turn_renders = []

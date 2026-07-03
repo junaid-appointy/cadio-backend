@@ -28,13 +28,13 @@ formats. "Professional" concretely means:
 | Kind of model | Status | What unlocks it |
 |---|---|---|
 | Boxy functional parts (enclosures, brackets, trays) | ✅ works today | — |
-| Curvy professional CAD (lofted shells, revolved vases, swept handles, fillet-heavy housings, threads/knurls) | ⚠️ engine capable, agent under-taught & blind | **Track B** (corpus depth + agent eyes) |
+| Curvy professional CAD (lofted shells, revolved vases, swept handles, fillet-heavy housings) | ✅ Track B done — corpus recipes + agent render-critique | (threads/knurls still thin; extend corpus as needed) |
 | Detailed/stylized/organic (sculpted, textured, decorative, character-like) | ❌ not intentional for Engine 1 | **Track C** (Blender engine) |
 | Artistic from-scratch generation (text→mesh) | ❌ deferred by design | Engine 3 (after C) |
 
 ---
 
-## Track A — Projects & persistence (the professional backbone)
+## Track A — Projects & persistence  ✅ done 2026-07-03
 
 **Problem.** Runs land in one flat global history; conversations live in
 server RAM (reload/restart = amnesia); references are global. The user cannot
@@ -88,7 +88,7 @@ project's Runs/references show only its own; old flat history appears under
 
 ---
 
-## Track B — Engine 1 professionalization (curvy, detailed, verified CAD)
+## Track B — Engine 1 professionalization  ✅ done 2026-07-03 (B1 corpus, B2 eyes, B3 import)
 
 **Problem.** Output looks "simple polygon" not because OCCT is weak but
 because (a) the corpus only teaches box-level recipes, (b) the agent never

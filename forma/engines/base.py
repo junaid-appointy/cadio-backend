@@ -61,6 +61,7 @@ class ExecutionResult:
     params: dict[str, Any] = field(default_factory=dict)
     manifest: list[ParamSpec] = field(default_factory=list)
     artifacts: dict[str, str] = field(default_factory=dict)  # kind -> file path
+    renders: dict[str, str] = field(default_factory=dict)  # view name -> png path
     bbox: dict[str, list[float]] | None = None  # {"min": [x,y,z], "max": [x,y,z], "size": [...]}
     volume_mm3: float | None = None
     validation: ValidationReport | None = None
@@ -73,6 +74,7 @@ class ExecutionResult:
             "params": self.params,
             "manifest": [p.to_dict() for p in self.manifest],
             "artifacts": self.artifacts,
+            "renders": self.renders,
             "bbox": self.bbox,
             "volume_mm3": self.volume_mm3,
             "validation": self.validation.to_dict() if self.validation else None,

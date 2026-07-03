@@ -80,6 +80,27 @@ superseded by Track A.
 
 ## Build log
 
+**2026-07-03 — Track A (projects/persistence) + Track B (Engine-1 pro).**
+*Track A:* SQLite store (`forma/store.py`: projects/messages/runs/assets, WAL,
+single-writer lock); all data under `~/.forma/projects/<pid>/`; project-scoped
+API; **websocket conversation resume** — the orchestrator's LLM history is
+rebuilt from stored messages via one serializer (`forma/api/history.py`) that
+also drives UI scrollback, so the agent genuinely remembers across reload and
+restart. React project **home + router** (`/`, `/p/<pid>`), inline project
+rename, SPA-fallback route. Legacy flat runs/assets auto-migrate into an
+"Unsorted imports" project (idempotent, timestamps + files preserved).
+*Track B:* **B1** corpus depth — verified recipes for revolve, shell, loft,
+sweep (perpendicular-plane), fillet/chamfer, polar/grid patterns, splines
+(each executed through the engine before entering the corpus); program
+contract now blesses builder mode. **B2 agent eyes** — `forma/render.py`
+renders 4 views (matplotlib Agg, headless) per non-preview run; the
+orchestrator feeds them to vision models as a post-build user message so the
+agent critiques SHAPE before presenting (gated by `litellm.supports_vision`;
+render.png doubles as the project thumbnail; render messages are transient,
+not persisted). **B3** STEP/STL reference import — `inspect.py` measures
+bbox/volume/bore diameters; `inspect_geometry` agent tool; uploads accept
+geometry files; attachments split into vision-images vs inspectable-geometry.
+
 **2026-07-03 — stop control + icon/alignment pass.** Agent turns are now
 interruptible: ws `{"type":"stop"}` → cooperative cancel in the orchestrator
 (checked between LLM calls and per tool call; pending tool calls get a

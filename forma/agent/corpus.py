@@ -20,6 +20,12 @@ PROCESS RULES (always apply):
 - Confirm the design on a summary of key dimensions and hole positions BEFORE
   presenting the model as done — wrong geometry is cheap on paper, expensive
   after export.
+- After each build you are shown RENDERS of the result (iso/front/top/right).
+  Actually look at them: check the overall shape, proportions, and features
+  against the requirement and any reference images. Numbers passing validation
+  does NOT mean it looks right — if the form is wrong (missing feature, wrong
+  proportion, a boolean that did nothing, an unintended shape), fix the program
+  and rebuild before telling the user it's done.
 - Every requirement number becomes a named parameter in PARAMS, and hard
   requirements become assert statements inside build().
 - After each run, read the validation report and self-repair errors before
@@ -59,5 +65,66 @@ MODELING RULES (precision engine / build123d):
 """
 
 
+# Recipes — every snippet below was executed through the engine and verified to
+# build and validate. Use BuildPart/BuildSketch/BuildLine (builder mode) for
+# these; they cover the curvy, professional shapes OCCT is good at. Don't
+# default to Box/Cylinder unions when one of these fits.
+MODELING_RECIPES = r'''
+RECIPES (verified — adapt dimensions to the requirement):
+
+REVOLVE (vases, knobs, pulleys, bottles) — a profile spun around Z. Hollow it
+by offsetting with the top face as an opening:
+    with BuildPart() as part:
+        with BuildSketch(Plane.XZ):
+            with BuildLine():
+                Polyline((0,0),(35,0),(35,4),(12,10),(30,40),(28,H),(0,H),close=True)
+            make_face()
+        revolve(axis=Axis.Z)
+        offset(amount=-WALL, openings=part.faces().sort_by(Axis.Z)[-1])
+
+SHELL / thin-wall (enclosures from a solid) — hollow a solid, open one face:
+    with BuildPart() as part:
+        Box(W, D, H)
+        offset(amount=-WALL, openings=part.faces().sort_by(Axis.Z)[-1])
+
+LOFT (ergonomic transitions, adapters) — blend between profiles on parallel planes:
+    with BuildPart() as part:
+        with BuildSketch(Plane.XY):          Rectangle(40, 40)
+        with BuildSketch(Plane.XY.offset(H)): Circle(12)
+        loft()
+
+SWEEP (handles, hooks, tubes, channels) — a profile driven along a path. The
+profile plane MUST be perpendicular to the path start, or the sweep collapses:
+    with BuildPart() as part:
+        with BuildLine(Plane.XZ) as path:
+            CenterArc((0,0), R, 0, 120)
+        prof_plane = Plane(origin=path.line @ 0, z_dir=path.line % 0)
+        with BuildSketch(prof_plane): Circle(5)
+        sweep(path=path.line)
+
+FILLET + CHAMFER (soften/board edges) — fillet after booleans; select edges:
+    fillet(part.edges().filter_by(Axis.Z), radius=R)         # vertical edges
+    chamfer(part.faces().sort_by(Axis.Z)[-1].edges(), length=2)  # top rim
+
+POLAR / GRID hole patterns (bolt circles, vents):
+    with Locations((0,0,0)):
+        with PolarLocations(radius=28, count=N): Hole(3)
+    # GridLocations(x_spacing, y_spacing, x_count, y_count) for rectangular grids
+
+SPLINE profiles (freeform / organic outlines) — Spline through points, close
+the face with lines, extrude:
+    with BuildSketch():
+        with BuildLine():
+            Spline((-30,0),(-10,15),(10,-5),(30,10))
+            Line((30,10),(30,-15)); Line((30,-15),(-30,-15)); Line((-30,-15),(-30,0))
+        make_face()
+    extrude(amount=T)
+
+Return `part.part` from a BuildPart context. Guard against degenerate input
+(a zero-length arc, a spline that self-intersects) — the validator will reject
+a collapsed or non-watertight result; read its message and fix the geometry.
+'''
+
+
 def system_corpus() -> str:
-    return PROCESS_RULES + "\n" + MODELING_RULES
+    return PROCESS_RULES + "\n" + MODELING_RULES + "\n" + MODELING_RECIPES

@@ -43,8 +43,13 @@ A precision-engine program is a Python file using build123d (algebra mode) that 
    never a magic number inside build().
 
 2. `build(params: dict) -> Part` — pure function from parameter values to a
-   single solid (use build123d algebra mode: Box, Cylinder, Pos, Rot, fillet,
-   chamfer, boolean +/-). Units are millimetres.
+   single solid. Units are millimetres. Two styles, both fine (return a Part):
+   - algebra mode: `Box(...)`, `Cylinder(...)`, `Pos(x,y,z)*shape`, `+`/`-`,
+     `fillet(...)`, `chamfer(...)` — good for boxy assemblies.
+   - builder mode: `with BuildPart() as part: ...; return part.part` — needed
+     for revolve, sweep, loft, shell/offset, patterns, splines (see RECIPES).
+   Prefer the operation that matches the SHAPE; don't force everything into
+   box/cylinder unions.
    Assert requirement facts inside build() with plain `assert` statements
    (e.g. `assert cavity_depth >= 32.4, "clearance under plate"`) so violated
    requirements fail loudly instead of producing wrong geometry.
@@ -153,12 +158,20 @@ class PrecisionEngine:
         if glb:
             artifacts["glb"] = str(glb)
 
+        # renders are the agent's eyes + the project thumbnail — non-preview only
+        renders: dict[str, str] = {}
+        if not preview:
+            from ...render import render_views
+
+            renders = render_views(Path(artifacts["stl"]), run_dir)
+
         return ExecutionResult(
             ok=True,
             run_dir=run_dir,
             params=raw["params"],
             manifest=manifest,
             artifacts=artifacts,
+            renders=renders,
             bbox=raw["bbox"],
             volume_mm3=raw["volume_mm3"],
             validation=validation,
