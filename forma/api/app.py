@@ -36,7 +36,7 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -47,8 +47,13 @@ from .providers import ProviderError, list_models
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = ROOT / "runs"
+ASSETS_DIR = ROOT / "assets"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 RUNS_DIR.mkdir(exist_ok=True)
+ASSETS_DIR.mkdir(exist_ok=True)
+
+ASSET_MAX_BYTES = 15 * 1024 * 1024
+ASSET_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 app = FastAPI(title="Forma", version="0.0.1")
 engine = PrecisionEngine()
@@ -143,6 +148,60 @@ def example_program():
     return {"code": (ROOT / "examples" / "simple_box.py").read_text()}
 
 
+def _asset_meta(meta_file: Path) -> dict | None:
+    try:
+        return json.loads(meta_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+@app.post("/api/assets")
+async def upload_asset(file: UploadFile):
+    """Store a reference image; returns {id, url, name}. Reusable in any
+    later chat message via its id."""
+    mime = file.content_type or ""
+    if mime not in ASSET_MIMES:
+        return JSONResponse({"error": f"unsupported type {mime!r} — upload an image"}, status_code=400)
+    data = await file.read()
+    if len(data) > ASSET_MAX_BYTES:
+        return JSONResponse({"error": "image larger than 15MB"}, status_code=400)
+
+    asset_id = uuid.uuid4().hex[:12]
+    ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}[mime]
+    (ASSETS_DIR / f"{asset_id}{ext}").write_bytes(data)
+    meta = {
+        "id": asset_id,
+        "file": f"{asset_id}{ext}",
+        "url": f"/assets/{asset_id}{ext}",
+        "name": Path(file.filename or "image").name[:80],
+        "mime": mime,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    (ASSETS_DIR / f"{asset_id}.json").write_text(json.dumps(meta))
+    return meta
+
+
+@app.get("/api/assets")
+def list_assets():
+    metas = [m for f in ASSETS_DIR.glob("*.json") if (m := _asset_meta(f))]
+    return sorted(metas, key=lambda m: m.get("created_at", ""), reverse=True)
+
+
+def _asset_paths(asset_ids: list[str]) -> list[Path]:
+    """Resolve ids -> files, rejecting anything that isn't a known asset id
+    (ids are our own hex strings — never treat them as paths)."""
+    paths = []
+    for asset_id in asset_ids[:8]:
+        if not (isinstance(asset_id, str) and asset_id.isalnum()):
+            continue
+        meta = _asset_meta(ASSETS_DIR / f"{asset_id}.json")
+        if meta:
+            p = ASSETS_DIR / meta["file"]
+            if p.exists():
+                paths.append(p)
+    return paths
+
+
 class ProviderModelsRequest(BaseModel):
     provider: str
     api_key: str
@@ -197,12 +256,12 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
     async def worker():
         nonlocal orch
         while True:
-            text = await chat_q.get()
+            text, images = await chat_q.get()
             if orch is None:  # no init received — query-param model + env keys
                 orch = make_orch(model, None)
             await ws.send_json({"type": "status", "state": "thinking"})
             try:
-                reply = await asyncio.to_thread(orch.send, text)
+                reply = await asyncio.to_thread(orch.send, text, images)
                 await ws.send_json({"type": "assistant", "text": reply})
             except Exception as exc:
                 # drop the failed user turn so history stays consistent
@@ -228,7 +287,8 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
                 orch = make_orch(data.get("model"), data.get("api_key") or None)
                 await ws.send_json({"type": "ready", "model": orch.model})
             elif kind == "chat" and data.get("text", "").strip():
-                chat_q.put_nowait(data["text"])
+                images = _asset_paths(data.get("assets") or [])
+                chat_q.put_nowait((data["text"], images))
             elif kind == "answers":
                 answers_q.put(data.get("answers", []))
     except WebSocketDisconnect:
@@ -240,6 +300,7 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
 
 
 app.mount("/runs", StaticFiles(directory=RUNS_DIR), name="runs")
+app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 if FRONTEND_DIST.exists():
     # production build of the React app (frontend/: `npm run build`)

@@ -16,7 +16,9 @@ web UI receives live events (`on_event`) over a websocket.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 from datetime import datetime
 from pathlib import Path
@@ -163,9 +165,24 @@ class Orchestrator:
             return json.dumps(payload)
         return json.dumps({"error": f"unknown tool {name}"})
 
-    def send(self, user_message: str) -> str:
-        """One conversational turn: returns the agent's final text."""
-        self.messages.append({"role": "user", "content": user_message})
+    @staticmethod
+    def _image_block(path: Path) -> dict:
+        mime = mimetypes.guess_type(str(path))[0] or "image/png"
+        data = base64.standard_b64encode(path.read_bytes()).decode()
+        # OpenAI image format — LiteLLM converts per provider (needs a
+        # vision-capable model)
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+
+    def send(self, user_message: str, images: list[Path] | None = None) -> str:
+        """One conversational turn: returns the agent's final text.
+        `images` are reference photos — shape/topology only; the corpus rules
+        forbid the agent from reading dimensions off them."""
+        if images:
+            content: Any = [{"type": "text", "text": user_message}]
+            content += [self._image_block(Path(p)) for p in images]
+        else:
+            content = user_message
+        self.messages.append({"role": "user", "content": content})
         while True:
             extra = {"api_key": self.api_key} if self.api_key else {}
             response = litellm.completion(

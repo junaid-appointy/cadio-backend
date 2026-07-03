@@ -25,9 +25,13 @@ cd frontend && npm install && npm run build && cd ..
 **Web workspace (primary):** export your provider key first, then
 
 ```sh
-export GEMINI_API_KEY=...    # or ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY
-.venv/bin/uvicorn forma.api.app:app            # → http://127.0.0.1:8000
+.venv/bin/python -m forma.cli serve            # → http://127.0.0.1:8000
+# dev: --reload   (watches only forma/; do NOT use plain `uvicorn --reload` —
+#                  it watches runs/ and restarts the server mid-conversation)
 ```
+
+API keys are entered in the UI (⚙ settings — stored in your browser, sent
+per-connection); exporting provider env vars still works as a fallback.
 
 Chat with the agent on the left (it asks clarifying questions as inline
 forms), watch the model appear in the 3D viewer, tweak dimensions with the

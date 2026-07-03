@@ -143,10 +143,11 @@ requirements the agent has gathered (from ask_user answers + stated specs),
 always visible, editable, and fed back to the agent on change. (Requires
 agent-side structured intent tracking — coordinate with backend corpus work.)
 
-### 3.3 Image input
-Upload reference photos in chat (vision models); required for the socket-
-back-box exit test. Drag-and-drop, preview thumbnails, multimodal message
-format through LiteLLM.
+### 3.3 Image input  ✅ done 2026-07-03 (pulled forward)
+Upload reference photos in chat (vision models); drag-and-drop, 📎 button,
+reusable 🖼 reference library (re-attach any earlier upload at any time),
+thumbnails in messages, multimodal via LiteLLM. Also landed early from 2.2:
+ws auto-reconnect with backoff, and the `forma serve` reload fix.
 
 ### 3.4 Recipe export & sharing prep
 "Export recipe" (zip: program + params + intent + meta) so no model is a

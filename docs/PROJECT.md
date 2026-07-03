@@ -77,6 +77,23 @@ provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
 
 ## Build log
 
+**2026-07-03 — image references + disconnect fix + auto-reconnect.**
+- **Root-caused the mid-conversation disconnects:** `uvicorn --reload` watches
+  the whole repo, so the engine writing `runs/*/program.py` triggered a server
+  restart, killing the websocket (visible in the user's log). Fix: `python -m
+  forma.cli serve --reload` watches only the `forma/` package. Frontend also
+  gained **auto-reconnect** (5 attempts, backoff, re-sends init with model+key)
+  with an honest note that a server restart resets the agent's conversation.
+- **Reference images:** `POST/GET /api/assets` (15MB cap, image mimes only,
+  ids validated — never treated as paths), served at `/assets/`. Chat accepts
+  attachments via 📎 upload, drag-drop onto the composer, or 🖼 the reference
+  library (any previously uploaded image can be re-attached at any time).
+  Attachments flow over the ws as asset ids → orchestrator builds multimodal
+  content (base64 data URLs, OpenAI image format — LiteLLM converts per
+  provider; needs a vision-capable model). Corpus rule added: describe what
+  you see and confirm the object before asking questions; dimensions still
+  always come from the user.
+
 **2026-07-03 — frontend plan items 1.1 + 1.2 landed.**
 (1.1) Provider & API key live in the UI: settings slide-over with provider
 select, per-provider key storage (localStorage), live model list fetched from

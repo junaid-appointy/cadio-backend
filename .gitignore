@@ -7,3 +7,4 @@ runs/
 node_modules/
 dist/
 .sandbox_home/
+assets/

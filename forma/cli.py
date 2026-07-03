@@ -49,6 +49,19 @@ def cmd_run(args) -> int:
     return 0 if v.ok else 2
 
 
+def cmd_serve(args) -> int:
+    """Run the web server. With --reload, watches ONLY the forma package —
+    plain `uvicorn --reload` watches the whole repo, so the engine writing
+    runs/*/program.py restarts the server mid-conversation."""
+    import uvicorn
+
+    kwargs = {}
+    if args.reload:
+        kwargs = {"reload": True, "reload_dirs": [str(Path(__file__).parent)]}
+    uvicorn.run("forma.api.app:app", host=args.host, port=args.port, **kwargs)
+    return 0
+
+
 def cmd_chat(args) -> int:
     from .agent.orchestrator import Orchestrator
 
@@ -88,6 +101,13 @@ def main() -> int:
                        help="override a parameter (repeatable)")
     p_run.add_argument("-o", "--out", help="output directory")
     p_run.set_defaults(func=cmd_run)
+
+    p_serve = sub.add_parser("serve", help="run the web server (reload-safe)")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument("--reload", action="store_true",
+                         help="auto-reload on backend code changes (runs/ excluded)")
+    p_serve.set_defaults(func=cmd_serve)
 
     p_chat = sub.add_parser("chat", help="interactive agent session")
     p_chat.add_argument(
