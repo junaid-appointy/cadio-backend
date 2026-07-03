@@ -54,6 +54,10 @@ the answered dimension (150mm) measured in the produced geometry.
 
 ## Next steps
 
+**Frontend track:** see `docs/FRONTEND-PLAN.md` (3 phases; next up: 1.1
+provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
+1.3 app shell polish).
+
 - [ ] Agent exit test: recreate the socket back box from photos + Q&A alone
       (needs image input in the CLI/chat path — add `--image` attachment)
 - [ ] Stub second engine to prove the contract (Phase-0 architecture exit test)
