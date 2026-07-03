@@ -105,10 +105,12 @@ class Orchestrator:
         engine: Engine,
         runs_root: Path,
         model: str | None = None,
+        api_key: str | None = None,
         ask_user: Callable[[list[dict]], list[dict]] | None = None,
         on_event: Callable[[dict], None] | None = None,
     ):
         self.model = model or DEFAULT_MODEL
+        self.api_key = api_key or None  # falls back to provider env vars
         self.engine = engine
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
@@ -165,12 +167,14 @@ class Orchestrator:
         """One conversational turn: returns the agent's final text."""
         self.messages.append({"role": "user", "content": user_message})
         while True:
+            extra = {"api_key": self.api_key} if self.api_key else {}
             response = litellm.completion(
                 model=self.model,
                 max_tokens=16000,
                 messages=[{"role": "system", "content": self._system_prompt()}]
                 + self.messages,
                 tools=TOOLS,
+                **extra,
             )
             msg = response.choices[0].message
             tool_calls = msg.tool_calls or []

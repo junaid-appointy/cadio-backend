@@ -9,7 +9,11 @@ REST:
   GET  /runs/...         static artifacts (stl/step/glb/program.py)
   GET  /                 the workspace page
 
-WebSocket /ws/chat?model=provider/model-id — the agent loop:
+WebSocket /ws/chat — the agent loop:
+  client -> {"type":"init","model":...,"api_key":...}  configure the session
+            (key held in connection memory only; never persisted or logged);
+            server replies {"type":"ready","model":...}. `?model=` query param
+            remains as a fallback when no init is sent.
   client -> {"type":"chat","text":...}          user message
   client -> {"type":"answers","answers":[...]}  reply to an ask_user form
   server -> {"type":"status","state":"thinking"|"running_cad"|"idle",...}
@@ -37,6 +41,7 @@ from pydantic import BaseModel
 
 from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
+from .providers import ProviderError, list_models
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = ROOT / "runs"
@@ -107,6 +112,21 @@ def example_program():
     return {"code": (ROOT / "examples" / "simple_box.py").read_text()}
 
 
+class ProviderModelsRequest(BaseModel):
+    provider: str
+    api_key: str
+
+
+@app.post("/api/providers/models")
+def provider_models(req: ProviderModelsRequest):
+    """List models the given key can access. Doubles as the key-validity test.
+    The key is used for this one outbound call and discarded."""
+    try:
+        return {"models": list_models(req.provider, req.api_key)}
+    except ProviderError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 @app.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket, model: str | None = None):
     await ws.accept()
@@ -135,13 +155,20 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
         else:
             send_threadsafe(event)
 
-    orch = Orchestrator(
-        engine, RUNS_DIR, model=model, ask_user=ask_user, on_event=on_event
-    )
+    orch: Orchestrator | None = None
+
+    def make_orch(m: str | None, api_key: str | None) -> Orchestrator:
+        return Orchestrator(
+            engine, RUNS_DIR, model=m or model, api_key=api_key,
+            ask_user=ask_user, on_event=on_event,
+        )
 
     async def worker():
+        nonlocal orch
         while True:
             text = await chat_q.get()
+            if orch is None:  # no init received — query-param model + env keys
+                orch = make_orch(model, None)
             await ws.send_json({"type": "status", "state": "thinking"})
             try:
                 reply = await asyncio.to_thread(orch.send, text)
@@ -166,7 +193,10 @@ async def ws_chat(ws: WebSocket, model: str | None = None):
         while True:
             data = await ws.receive_json()
             kind = data.get("type")
-            if kind == "chat" and data.get("text", "").strip():
+            if kind == "init":
+                orch = make_orch(data.get("model"), data.get("api_key") or None)
+                await ws.send_json({"type": "ready", "model": orch.model})
+            elif kind == "chat" and data.get("text", "").strip():
                 chat_q.put_nowait(data["text"])
             elif kind == "answers":
                 answers_q.put(data.get("answers", []))
