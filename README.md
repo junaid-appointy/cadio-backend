@@ -20,41 +20,40 @@ cd frontend && npm install && npm run build && cd ..
 
 > First execution can be slow (~1–2 min): macOS verifies the OCCT dylib once.
 
-## Use
+## Run
 
-**Web workspace (primary):** export your provider key first, then
-
-```sh
-.venv/bin/python -m forma.cli serve            # → http://127.0.0.1:8000
-# (plain `uvicorn forma.api.app:app --reload` also works — all runtime data
-#  lives in ~/.forma, so runs can't trigger the dev reloader)
-```
-
-API keys are entered in the UI (⚙ settings — stored in your browser, sent
-per-connection); exporting provider env vars still works as a fallback.
-
-Chat with the agent on the left (it asks clarifying questions as inline
-forms), watch the model appear in the 3D viewer, tweak dimensions with the
-Params sliders (rebuilds without the LLM), edit raw code in the Code tab,
-reload old versions from Runs, export STL/STEP/GLB top-right. Set the model id
-in the header (LiteLLM format, e.g. `gemini/gemini-2.5-pro`) and hit connect.
-
-Frontend dev (hot reload): `cd frontend && npm run dev` → http://localhost:5173
-(proxies API/websocket/artifacts to uvicorn on :8000).
+**One command — that's it:**
 
 ```sh
-# CLI alternatives:
-.venv/bin/python -m forma.cli run examples/simple_box.py --set length=200 --set wall=3
-
-# Agent REPL — bring any provider's key (Anthropic, OpenAI, Gemini, xAI/Grok, …)
-export ANTHROPIC_API_KEY=...            # or OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY
-.venv/bin/python -m forma.cli chat                       # default: anthropic/claude-opus-4-8
-.venv/bin/python -m forma.cli chat --model gemini/gemini-2.5-pro
+uv run forma            # → http://127.0.0.1:8000
 ```
 
-The agent is provider-agnostic (LiteLLM): set `FORMA_MODEL` or pass `--model`
-as `provider/model-id`, using the **exact model id your provider serves** —
-a wrong id 404s. To list what your key can access:
+Auto-reload is on and safe (all runtime data lives in `~/.forma`, outside the
+repo). No flags to remember. API keys are entered in the UI (settings, stored
+in your browser); provider env vars still work as a fallback.
+
+You land on the project home; create a project and start describing parts. The
+agent asks clarifying questions, builds the model (and now *looks at its own
+renders* to check the shape), and you fine-tune with realtime Params sliders,
+edit code, reload versions, and export STL/STEP/GLB. Attach reference images or
+STEP/STL geometry with the paperclip. Everything persists per project and
+conversations resume across restarts.
+
+Frontend dev (hot reload): `cd frontend && npm run dev` → http://localhost:5173.
+Other CLI verbs: `uv run forma run <program.py>`, `uv run forma chat`.
+
+```sh
+# run a program directly:
+uv run forma run examples/simple_box.py --set length=200 --set wall=3
+
+# terminal agent (bring any provider's key):
+export GEMINI_API_KEY=...    # or ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY
+uv run forma chat --model gemini/gemini-2.5-pro
+```
+
+The agent is provider-agnostic (LiteLLM): in the web UI you pick the model from
+a live list; on the CLI set `FORMA_MODEL` or pass `--model` as
+`provider/model-id`. To list what a key can access:
 
 ```sh
 # Gemini (AI Studio key)
