@@ -144,6 +144,15 @@ slice verified end to end (CLI + API + viewer).
 
 ## Learnings & gotchas
 
+- **OCCT's STL writer emits zero-area triangles at sphere/revolve poles** —
+  their self-edges register as boundary edges, so a naive trimesh
+  `is_watertight` fails on a *perfect* Sphere(). This false positive sent the
+  agent through 18 futile redesigns of an engraved ball. The validator now
+  merges vertices + drops degenerate faces before judging (reported as a
+  warning), while genuinely open meshes still fail. Corpus told not to
+  redesign around a watertight failure that the cleaner handles, and gained
+  the engraving recipe (`extrude(Text(...), amount=...)`, overshoot the cut).
+
 - **Runtime data must live outside the repo** (`~/.forma`, override
   `FORMA_HOME`). The first "fix" for reload-disconnects was a safer serve
   command — but users keep typing the command they know (`uvicorn --reload`),

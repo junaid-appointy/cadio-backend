@@ -43,6 +43,19 @@ MODELING RULES (precision engine / build123d):
   screws ~ 0.8 x thread diameter, unsupported overhangs <= 45 degrees.
 - Boxes/Cylinders in build123d algebra mode are centered at the origin —
   position with Pos(x, y, z) * shape.
+- build123d API details that are easy to get wrong: `extrude(sketch,
+  amount=depth)` (the keyword is `amount`); `Text("S", font_size=10)` makes a
+  2D sketch on XY centered at origin; `Rot(x, y, z)` rotates in degrees.
+- Engraved/embossed text on a shape: extrude the Text sketch and boolean it
+  against the body, positioned so it clearly pierces the surface, e.g.
+  `sphere - Pos(0, 0, r - depth) * extrude(Text(...), amount=depth * 2)`
+  (engrave) or `sphere + ...` (emboss). Overshoot the depth — exactly-tangent
+  cuts create degenerate geometry. Text wrapped around a curved surface is
+  much harder; prefer a flat or near-flat engraving zone unless the user
+  insists.
+- Sphere/revolve tessellation produces harmless zero-area triangles at the
+  poles; the validator removes them automatically — do not redesign around a
+  watertightness failure unless it persists after that.
 """
 
 
