@@ -77,6 +77,16 @@ provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
 
 ## Build log
 
+**2026-07-03 — stop control + icon/alignment pass.** Agent turns are now
+interruptible: ws `{"type":"stop"}` → cooperative cancel in the orchestrator
+(checked between LLM calls and per tool call; pending tool calls get a
+"cancelled" result so history stays valid; a blocked ask_user is unblocked
+with no answers). Stop pill appears next to the thinking indicator. Emoji
+chrome replaced with an inline SVG icon set (Icons.tsx); composer redesigned
+as a single input card (textarea + icon bar + send); all controls normalized
+to a 32px rhythm; alignment verified programmatically via Playwright
+(bounding-box centers) plus the stop flow tested end to end.
+
 **2026-07-03 — 1.3 design pass + critical /assets shadowing fix.**
 Design system (layered surfaces, sans UI type + mono for technical values,
 tokens, transitions, styled scrollbars); top app bar (wordmark, connection
