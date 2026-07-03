@@ -59,9 +59,12 @@ the answered dimension (150mm) measured in the produced geometry.
 
 ## Next steps
 
-**Frontend track:** see `docs/FRONTEND-PLAN.md` (3 phases; next up: 1.1
-provider/key settings in UI → 1.2 realtime tweaks via warm worker pool →
-1.3 app shell polish).
+**Current direction (agreed 2026-07-03): `docs/ROADMAP.md` — Track A
+(projects & persistence) → Track B (Engine-1 professionalization: corpus
+depth, agent render-critique "eyes", geometry import) → Track C (Blender
+engine for detailed/stylized).** The frontend quality plan
+(`docs/FRONTEND-PLAN.md`) continues underneath; its 2.1 sessions item is
+superseded by Track A.
 
 - [ ] Agent exit test: recreate the socket back box from photos + Q&A alone
       (needs image input in the CLI/chat path — add `--image` attachment)

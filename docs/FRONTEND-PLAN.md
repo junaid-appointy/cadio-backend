@@ -98,11 +98,9 @@ a toast; no pane ever renders blank without an explanatory empty state.
 
 ## Phase 2 — depth
 
-### 2.1 Sessions & persistence
-Chat history and the current workspace survive reload; a project/session
-sidebar lists conversations. **Backend:** SQLite (sessions, messages, runs
-tables — the plan's data model §6.6 starts here); ws `session_id` resume;
-runs linked to sessions. This also unlocks the version-tree work (2.4).
+### 2.1 Sessions & persistence  → superseded by ROADMAP.md Track A
+Expanded into the full project flow (projects, scoped runs/assets, resumable
+conversations, home screen). See `docs/ROADMAP.md`.
 
 ### 2.2 Chat quality
 Markdown rendering (code blocks, lists) for agent messages; **streamed
