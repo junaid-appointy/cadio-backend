@@ -45,12 +45,10 @@ from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
 from .providers import ProviderError, list_models
 
-ROOT = Path(__file__).resolve().parents[2]
-RUNS_DIR = ROOT / "runs"
-ASSETS_DIR = ROOT / "assets"
+from ..config import ASSETS_DIR, REPO_ROOT, RUNS_DIR
+
+ROOT = REPO_ROOT
 FRONTEND_DIST = ROOT / "frontend" / "dist"
-RUNS_DIR.mkdir(exist_ok=True)
-ASSETS_DIR.mkdir(exist_ok=True)
 
 ASSET_MAX_BYTES = 15 * 1024 * 1024
 ASSET_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}

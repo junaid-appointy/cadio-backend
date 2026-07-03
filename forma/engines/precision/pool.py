@@ -83,10 +83,12 @@ class _Worker:
 
 class WorkerPool:
     def __init__(self, size: int = 2, timeout_s: float = 90.0, boot_timeout_s: float = 180.0):
+        from ...config import SANDBOX_HOME  # outside the repo — see config.py
+
         self.timeout_s = timeout_s
         self.boot_timeout_s = boot_timeout_s
-        self.scratch = Path(__file__).resolve().parents[3] / ".sandbox_home"
-        self.scratch.mkdir(exist_ok=True)
+        self.scratch = SANDBOX_HOME
+        self.scratch.mkdir(parents=True, exist_ok=True)
         self._idle: queue.Queue[_Worker] = queue.Queue()
         for _ in range(size):
             self._idle.put(_Worker(self.scratch, boot_timeout_s))

@@ -12,9 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+from .config import RUNS_DIR as RUNS_ROOT
 from .engines.precision import PrecisionEngine
-
-RUNS_ROOT = Path.cwd() / "runs"
 
 
 def cmd_run(args) -> int:

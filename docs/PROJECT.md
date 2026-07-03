@@ -144,6 +144,13 @@ slice verified end to end (CLI + API + viewer).
 
 ## Learnings & gotchas
 
+- **Runtime data must live outside the repo** (`~/.forma`, override
+  `FORMA_HOME`). The first "fix" for reload-disconnects was a safer serve
+  command — but users keep typing the command they know (`uvicorn --reload`),
+  which watches the repo and restarted the server whenever the engine wrote
+  `runs/*/program.py`. A fix that requires changing habits isn't a fix; now
+  nothing is written inside the repo at runtime, so any command is safe.
+  (Legacy `runs/`, `assets/`, `.sandbox_home/` auto-migrate on first import.)
 - **Never mount user content at `/assets`** — Vite emits the app bundle under
   `/assets/*`; an earlier static mount silently shadows it and the page goes
   blank with only 404s in the console. Reference uploads live at `/refs/`.

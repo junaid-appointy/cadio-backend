@@ -26,8 +26,8 @@ cd frontend && npm install && npm run build && cd ..
 
 ```sh
 .venv/bin/python -m forma.cli serve            # → http://127.0.0.1:8000
-# dev: --reload   (watches only forma/; do NOT use plain `uvicorn --reload` —
-#                  it watches runs/ and restarts the server mid-conversation)
+# (plain `uvicorn forma.api.app:app --reload` also works — all runtime data
+#  lives in ~/.forma, so runs can't trigger the dev reloader)
 ```
 
 API keys are entered in the UI (⚙ settings — stored in your browser, sent
