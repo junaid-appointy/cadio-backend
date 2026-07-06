@@ -162,6 +162,29 @@ the face with lines, extrude:
         make_face()
     extrude(amount=T)
 
+MULTI-FEATURE OBJECT REPLICA (switchboards, keypads, connector panels, control
+faces — anything with a body plus a row/grid of repeated features). Build the
+BODY, then loop to place each repeated feature, then cut holes/grooves. This is
+how you replicate a real object faithfully instead of flattening it to a plate:
+    n, mw, H, D, m = int(gangs), module_w, height, depth, margin
+    W = n*mw + 2*m
+    with BuildPart() as part:
+        Box(W, H, D)
+        fillet(part.edges().filter_by(Axis.Z), radius=4)
+        front = D/2
+        for i in range(n):                       # one raised switch per module
+            x = -W/2 + m + mw*(i+0.5)
+            with Locations((x, 0, front)): Box(mw-5, H-2*m, 3)
+        for i in range(n):                       # toggle groove on each switch
+            x = -W/2 + m + mw*(i+0.5)
+            with Locations((x, 0, front+1.5)): Box(mw-5, 1.6, 2.2, mode=Mode.SUBTRACT)
+        for y in (H/2 - m/2, -(H/2 - m/2)):      # screw holes top & bottom
+            with Locations((0, y, 0)): Hole(radius=2)
+    return part.part
+Every repeated feature, cutout, boss, label and fastener gets modelled — count
+them off the reference image, ask the user for the real sizes/spacing, and put
+each one in. A feature-complete blocky replica is the goal, never a facade.
+
 Return `part.part` from a BuildPart context. Guard against degenerate input
 (a zero-length arc, a spline that self-intersects) — the validator will reject
 a collapsed or non-watertight result; read its message and fix the geometry.
