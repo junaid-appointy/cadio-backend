@@ -151,6 +151,20 @@ def patch_project(pid: str, req: ProjectPatch):
     return proj
 
 
+@app.delete("/api/projects/{pid}")
+def delete_project(pid: str):
+    if not store.delete_project(pid):
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{pid}/assets/{asset_id}")
+def delete_asset(pid: str, asset_id: str):
+    if not store.delete_asset(pid, asset_id):
+        return JSONResponse({"error": "asset not found"}, status_code=404)
+    return {"ok": True}
+
+
 @app.get("/api/projects/{pid}/runs")
 def project_runs(pid: str):
     return [_run_payload(pid, r) for r in store.list_runs(pid)]

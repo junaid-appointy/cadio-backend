@@ -194,6 +194,12 @@ slice verified end to end (CLI + API + viewer).
   `runs/*/program.py`. A fix that requires changing habits isn't a fix; now
   nothing is written inside the repo at runtime, so any command is safe.
   (Legacy `runs/`, `assets/`, `.sandbox_home/` auto-migrate on first import.)
+- **Keep the Vite dev proxy in sync with backend mounts.** When Track A moved
+  artifacts/refs to `/files` and previews to `/previews`, the `vite.config.ts`
+  proxy still only listed `/api`,`/runs`,`/ws` — so in `npm run dev` (:5173)
+  every image AND the 3D model 404'd (they load fine on the built app at :8000
+  where the mounts are native). Any new backend URL prefix must be added to
+  the dev proxy.
 - **Never mount user content at `/assets`** — Vite emits the app bundle under
   `/assets/*`; an earlier static mount silently shadows it and the page goes
   blank with only 404s in the console. Reference uploads live at `/refs/`.

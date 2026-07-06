@@ -126,6 +126,20 @@ class Store:
             self._conn.commit()
         return self.get_project(pid)
 
+    def delete_project(self, pid: str) -> bool:
+        """Permanently remove a project: DB rows + all its files on disk."""
+        with self._lock:
+            row = self._conn.execute("SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone()
+            if not row:
+                return False
+            for tbl in ("messages", "runs", "assets"):
+                self._conn.execute(f"DELETE FROM {tbl} WHERE project_id=?", (pid,))
+            self._conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+            self._conn.commit()
+        import shutil as _sh
+        _sh.rmtree(config.project_dir(pid), ignore_errors=True)
+        return True
+
     def _touch(self, pid: str) -> None:
         self._conn.execute("UPDATE projects SET updated_at=? WHERE id=?", (_now(), pid))
 
@@ -238,6 +252,20 @@ class Store:
                 "SELECT * FROM assets WHERE project_id=? ORDER BY created_at DESC", (pid,)
             ).fetchall()
         return [self._asset_dict(pid, r["id"], r["file"], r["name"], r["mime"], r["created_at"]) for r in rows]
+
+    def delete_asset(self, pid: str, asset_id: str) -> bool:
+        """Remove a reference asset: DB row + file on disk."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT file FROM assets WHERE project_id=? AND id=?", (pid, asset_id)
+            ).fetchone()
+            if not row:
+                return False
+            self._conn.execute("DELETE FROM assets WHERE project_id=? AND id=?", (pid, asset_id))
+            self._touch(pid)
+            self._conn.commit()
+        (config.project_refs_dir(pid) / row["file"]).unlink(missing_ok=True)
+        return True
 
     def get_asset(self, pid: str, asset_id: str) -> dict | None:
         with self._lock:
