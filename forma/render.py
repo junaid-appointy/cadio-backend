@@ -16,7 +16,7 @@ import matplotlib
 matplotlib.use("Agg")  # offscreen; must precede pyplot import
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection  # noqa: E402
+from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection  # noqa: E402
 
 # (elev, azim) per canonical view
 _VIEWS = {
@@ -38,6 +38,17 @@ def _shaded_faces(mesh) -> np.ndarray:
     return np.clip(shade[:, None] * base[None, :], 0, 1)
 
 
+def _feature_edges(mesh):
+    """Line segments for edges where adjacent faces meet at a sharp angle
+    (> ~22°) — the outlines of holes, cutouts, grooves and corners."""
+    try:
+        angles = mesh.face_adjacency_angles
+        edges = mesh.face_adjacency_edges[angles > 0.38]  # ~22 degrees
+        return mesh.vertices[edges]
+    except Exception:
+        return None
+
+
 def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None:
     verts = np.asarray(mesh.vertices)
     tris = verts[np.asarray(mesh.faces)]
@@ -45,6 +56,11 @@ def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None
     fig = plt.figure(figsize=(size / 100, size / 100), dpi=100)
     ax = fig.add_subplot(111, projection="3d")
     ax.add_collection3d(Poly3DCollection(tris, facecolors=colors, edgecolors="none"))
+    # outline sharp feature edges (holes, cuts, corners) so misplaced/stray
+    # features are visible — without the noise of every triangle edge.
+    segs = _feature_edges(mesh)
+    if segs is not None and len(segs):
+        ax.add_collection3d(Line3DCollection(segs, colors="#2a1e0a", linewidths=0.6))
     for axis, c in zip("xyz", center):
         getattr(ax, f"set_{axis}lim")(c - reach, c + reach)
     ax.set_box_aspect((1, 1, 1))
@@ -55,7 +71,7 @@ def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None
     plt.close(fig)
 
 
-def render_views(stl_path: Path, out_dir: Path, size: int = 640) -> dict[str, str]:
+def render_views(stl_path: Path, out_dir: Path, size: int = 768) -> dict[str, str]:
     """Render the canonical views PLUS a cut-away section, so the agent can see
     interior features (walls, floors, bosses, cavities) it might have omitted.
     Returns {view_name: png_path}. Best-effort — returns {} on any failure."""

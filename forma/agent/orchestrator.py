@@ -313,14 +313,16 @@ class Orchestrator:
                 blocks: list[Any] = [{
                     "type": "text",
                     "text": ("Renders of the model you just built (iso / front / top / right, "
-                             "plus a cut-away SECTION exposing the interior). Now do your "
-                             "completeness check: go through your feature checklist item by "
-                             "item against these images and the code. Is EVERY required "
-                             "feature present — every hole, cutout, port, boss, rib, lip, "
-                             "fillet, text, mounting point? Check the section view for interior "
-                             "features. If anything is missing, wrong, or simplified, add it "
-                             "and rebuild. Only reply to the user once every checklist item is "
-                             "verifiably present."),
+                             "plus a cut-away SECTION exposing the interior). Sharp feature "
+                             "edges — holes, cuts, grooves, corners — are outlined in dark. Now "
+                             "check TWO things: (1) COMPLETENESS — go through your feature "
+                             "checklist; is every required feature present (every hole, cutout, "
+                             "port, boss, rib, lip, fillet, text, mounting point)? (2) CORRECTNESS "
+                             "— is every feature in the RIGHT PLACE, and are there any stray, "
+                             "duplicate, or misplaced cuts/holes that should NOT be there? If "
+                             "anything is missing, wrong, misplaced, or spurious, fix the "
+                             "coordinates and rebuild. Only reply to the user once the model is "
+                             "both complete and clean."),
                 }]
                 for p in self._turn_renders:
                     try:
