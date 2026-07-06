@@ -253,9 +253,15 @@ class Orchestrator:
             if self._stop.is_set():
                 return "⏹ Stopped."
             extra = {"api_key": self.api_key} if self.api_key else {}
+            # push the model to reason harder about detailed multi-feature parts.
+            # reasoning_effort is best-effort — drop_params silently removes it
+            # for models that don't support it. (max_tokens kept at a value all
+            # common models accept; the CAD program itself is small.)
             response = litellm.completion(
                 model=self.model,
                 max_tokens=16000,
+                reasoning_effort="high",
+                drop_params=True,
                 messages=[{"role": "system", "content": self._system_prompt()}]
                 + self.messages,
                 tools=TOOLS,
@@ -306,10 +312,15 @@ class Orchestrator:
             if self._turn_renders and self._supports_vision():
                 blocks: list[Any] = [{
                     "type": "text",
-                    "text": ("Renders of the model you just built (iso / front / top / right). "
-                             "Look at them: does the SHAPE match the requirement and any "
-                             "reference images? If proportions, features, or form are wrong, "
-                             "fix the program and rebuild before replying to the user."),
+                    "text": ("Renders of the model you just built (iso / front / top / right, "
+                             "plus a cut-away SECTION exposing the interior). Now do your "
+                             "completeness check: go through your feature checklist item by "
+                             "item against these images and the code. Is EVERY required "
+                             "feature present — every hole, cutout, port, boss, rib, lip, "
+                             "fillet, text, mounting point? Check the section view for interior "
+                             "features. If anything is missing, wrong, or simplified, add it "
+                             "and rebuild. Only reply to the user once every checklist item is "
+                             "verifiably present."),
                 }]
                 for p in self._turn_renders:
                     try:

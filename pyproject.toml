@@ -7,6 +7,8 @@ dependencies = [
     "build123d",
     "trimesh",
     "manifold3d",
+    "shapely",
+    "matplotlib",
     "numpy",
     "fastapi",
     "uvicorn[standard]",
