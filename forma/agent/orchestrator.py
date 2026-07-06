@@ -60,6 +60,30 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "build_from_image",
+            "description": (
+                "Trace an attached flat image (logo, icon, badge, sign, silhouette) "
+                "and build a 3D model of it by extruding the ACTUAL traced outline "
+                "raised on a backing plate. Use this for any flat graphic instead of "
+                "hand-coding shapes — hand-coding drops parts of the outline. The "
+                "result reproduces the whole logo (every part), and is param-tweakable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "description": "id of the attached image"},
+                    "width_mm": {"type": "number", "description": "overall width (default 40)"},
+                    "logo_height_mm": {"type": "number", "description": "raised relief height (default 2)"},
+                    "base_thickness_mm": {"type": "number", "description": "backing plate thickness, 0 for logo-only (default 1.5)"},
+                    "label": {"type": "string"},
+                },
+                "required": ["asset_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "inspect_geometry",
             "description": (
                 "Measure an uploaded reference solid (STEP/STL) the user attached. "
@@ -133,6 +157,7 @@ class Orchestrator:
         on_event: Callable[[dict], None] | None = None,
         on_message: Callable[[str, dict], None] | None = None,
         inspect_asset: Callable[[str], dict] | None = None,
+        trace_asset: Callable[[str, dict], Any] | None = None,
     ):
         self.model = model or DEFAULT_MODEL
         self.api_key = api_key or None  # falls back to provider env vars
@@ -140,6 +165,7 @@ class Orchestrator:
         self.runs_root = Path(runs_root)
         self.ask_user = ask_user or _default_ask_user
         self.inspect_asset = inspect_asset
+        self.trace_asset = trace_asset
         self.on_event = on_event
         # on_message(role, record): fired as each message is appended, in a
         # base64-free persistence shape (see forma/api/history.py). Lets the
@@ -191,6 +217,24 @@ class Orchestrator:
             + system_corpus()
         )
 
+    def _run_program(self, code: str, params: dict | None, label: str) -> str:
+        """Execute a build123d program, emit the run event, queue renders for
+        the agent's eyes, and return the measured facts as a JSON string."""
+        self._emit({"type": "status", "state": "running_cad", "label": label})
+        run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        result = self.engine.execute(code, params, run_dir)
+        self.last_run_dir = run_dir
+        self._emit({"type": "run", "run_id": run_dir.name, "label": label,
+                    "result": result.to_dict()})
+        if result.ok and result.renders:
+            self._turn_renders = [Path(p) for p in result.renders.values()]
+        payload = result.to_dict()
+        payload.pop("run_dir", None)
+        payload.pop("renders", None)
+        if result.ok:
+            payload["artifacts"] = sorted(result.artifacts)
+        return json.dumps(payload)
+
     def _handle_tool(self, name: str, tool_input: dict) -> str:
         if name == "ask_user":
             return json.dumps(self.ask_user(tool_input["questions"]))
@@ -199,31 +243,19 @@ class Orchestrator:
                 return json.dumps({"error": "geometry inspection unavailable"})
             return json.dumps(self.inspect_asset(tool_input.get("asset_id", "")))
         if name == "run_cad":
-            label = tool_input.get("label", "")
-            self._emit({"type": "status", "state": "running_cad", "label": label})
-            run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-            result = self.engine.execute(
-                tool_input["code"], tool_input.get("params"), run_dir
-            )
-            self.last_run_dir = run_dir
-            self._emit(
-                {
-                    "type": "run",
-                    "run_id": run_dir.name,
-                    "label": label,
-                    "result": result.to_dict(),
-                }
-            )
-            # queue renders so the agent can SEE this build (flushed after the
-            # tool result, as a vision user-message — see send()).
-            if result.ok and result.renders:
-                self._turn_renders = [Path(p) for p in result.renders.values()]
-            payload = result.to_dict()
-            payload.pop("run_dir", None)      # the agent needs facts, not paths
-            payload.pop("renders", None)      # shown as images, not JSON
-            if result.ok:
-                payload["artifacts"] = sorted(result.artifacts)
-            return json.dumps(payload)
+            return self._run_program(
+                tool_input["code"], tool_input.get("params"), tool_input.get("label", ""))
+        if name == "build_from_image":
+            if not self.trace_asset:
+                return json.dumps({"error": "image tracing unavailable"})
+            traced = self.trace_asset(tool_input.get("asset_id", ""), {
+                "width_mm": tool_input.get("width_mm", 40.0),
+                "logo_height_mm": tool_input.get("logo_height_mm", 2.0),
+                "base_thickness_mm": tool_input.get("base_thickness_mm", 1.5),
+            })
+            if isinstance(traced, dict):  # an error
+                return json.dumps(traced)
+            return self._run_program(traced, None, tool_input.get("label", "from image"))
         return json.dumps({"error": f"unknown tool {name}"})
 
     @staticmethod

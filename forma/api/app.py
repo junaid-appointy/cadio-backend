@@ -373,10 +373,27 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
             return {"error": f"no such reference geometry: {aid!r}"}
         return inspect_geometry(p)
 
+    def trace_asset(aid: str, opts: dict):
+        """Image -> build123d program (traced outline). str on success, {'error'} on failure."""
+        from .. import trace
+        a = store.get_asset(pid, aid)
+        p = asset_path(aid)
+        if not a or not p:
+            return {"error": f"no such image: {aid!r}"}
+        if not a["mime"].startswith("image/"):
+            return {"error": "build_from_image needs an image (PNG/JPG/WEBP)"}
+        try:
+            tr = trace.trace_polygons(p)
+        except ValueError as exc:
+            return {"error": f"could not trace the image: {exc}"}
+        return trace.generate_program(
+            tr, opts.get("width_mm", 40.0), opts.get("logo_height_mm", 2.0),
+            opts.get("base_thickness_mm", 1.5))
+
     orch = Orchestrator(
         engine, config.project_runs_dir(pid),
         ask_user=ask_user, on_event=on_event, on_message=on_message,
-        inspect_asset=inspect_asset,
+        inspect_asset=inspect_asset, trace_asset=trace_asset,
     )
     # rebuild the agent's memory from stored history (resume)
     records = store.get_messages(pid)
@@ -415,10 +432,14 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
             elif kind == "chat" and data.get("text", "").strip():
                 images, geometry = _split_assets(pid, data.get("assets") or [])
                 text = data["text"]
-                if geometry:  # tell the agent the ids so it can inspect_geometry
-                    lines = "\n".join(f"- id={g['id']} ({g['name']})" for g in geometry)
+                if images:  # ids so the agent can trace a flat logo with build_from_image
+                    ilines = "\n".join(f"- id={img['id']}" for img in images)
+                    text += ("\n\n[Attached image ids — for a flat logo/icon/graphic, use "
+                             f"build_from_image to trace the real outline:\n{ilines}]")
+                if geometry:  # ids so the agent can inspect_geometry
+                    glines = "\n".join(f"- id={g['id']} ({g['name']})" for g in geometry)
                     text += ("\n\n[Reference geometry attached — measure with "
-                             f"inspect_geometry before asking for known dimensions:\n{lines}]")
+                             f"inspect_geometry before asking for known dimensions:\n{glines}]")
                 chat_q.put_nowait((text, images))
             elif kind == "answers":
                 answers_q.put(data.get("answers", []))

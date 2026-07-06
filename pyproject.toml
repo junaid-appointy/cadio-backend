@@ -9,6 +9,7 @@ dependencies = [
     "manifold3d",
     "shapely",
     "rtree",
+    "opencv-python-headless",
     "matplotlib",
     "numpy",
     "fastapi",
