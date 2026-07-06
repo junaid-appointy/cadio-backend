@@ -80,6 +80,20 @@ superseded by Track A.
 
 ## Build log
 
+**2026-07-06 — parameter → affected-geometry highlighting.** Click a parameter
+in the Params panel and the faces it controls glow cyan in the viewer.
+Mechanism (`forma/affect.py`): there's no stored param→face mapping (the number
+flows through arbitrary build123d code), so we discover it empirically — nudge
+the one parameter, rebuild (warm preview, ~20-50ms), and diff the meshes.
+Symmetric diff via trimesh nearest-surface (needs `rtree`): base faces that
+MOVED (wall/hole size) plus base faces nearest to geometry the perturbation
+ADDED/REMOVED (height/count growing the model), so extend-type params are
+caught too. Face indices are in STL facet order = the browser STLLoader's
+triangle order, so the viewer recolours them directly (per-vertex colours).
+Precomputed in a background thread on every save → `affect.json` beside the
+artifacts; `GET /…/runs/{id}/affect` serves the cache or computes on demand.
+Highlight applies only to the stable saved model, not live slider previews.
+
 **2026-07-03 — Track A (projects/persistence) + Track B (Engine-1 pro).**
 *Track A:* SQLite store (`forma/store.py`: projects/messages/runs/assets, WAL,
 single-writer lock); all data under `~/.forma/projects/<pid>/`; project-scoped

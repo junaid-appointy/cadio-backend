@@ -33,9 +33,11 @@ WebSocket /ws/chat?project=<pid> — the agent loop for one project:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import queue
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -45,7 +47,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import config
+from .. import affect, config
 from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
 from ..store import Store
@@ -95,7 +97,24 @@ def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
               parent_run_id: str | None = None) -> dict:
     meta = _result_to_meta(run_id, result_dict)
     run = store.add_run(pid, run_id, label, bool(meta.get("ok")), meta, parent_run_id)
+    # precompute the parameter→affected-faces map in the background so clicking a
+    # parameter highlights instantly (see /affect endpoint for the lazy fallback)
+    if meta.get("ok") and meta.get("manifest"):
+        run_dir = config.project_runs_dir(pid) / run_id
+        threading.Thread(
+            target=_precompute_affect,
+            args=(run_dir, result_dict.get("params", {}), result_dict.get("manifest", [])),
+            daemon=True,
+        ).start()
     return _run_payload(pid, run)
+
+
+def _precompute_affect(run_dir: Path, params: dict, manifest: list) -> None:
+    try:
+        code = (run_dir / "program.py").read_text()
+        affect.build_and_cache(engine, code, params, manifest, run_dir)
+    except Exception:
+        pass  # best-effort; the endpoint recomputes on demand if this failed
 
 
 # ---- config / example -----------------------------------------------------
@@ -168,6 +187,27 @@ def delete_asset(pid: str, asset_id: str):
 @app.get("/api/projects/{pid}/runs")
 def project_runs(pid: str):
     return [_run_payload(pid, r) for r in store.list_runs(pid)]
+
+
+@app.get("/api/projects/{pid}/runs/{run_id}/affect")
+def run_affect(pid: str, run_id: str):
+    """{param_name: [affected face index, ...]} for a run. Served from the cached
+    affect.json if the background precompute finished; otherwise computed now."""
+    run = store.get_run(pid, run_id)
+    if not run:
+        return JSONResponse({"error": "run not found"}, status_code=404)
+    run_dir = config.project_runs_dir(pid) / run_id
+    cached = affect.affect_path(run_dir)
+    if cached.exists():
+        try:
+            return json.loads(cached.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    meta = run["meta"]
+    if not meta.get("ok") or not (run_dir / "program.py").exists():
+        return {}
+    code = (run_dir / "program.py").read_text()
+    return affect.build_and_cache(engine, code, meta.get("params", {}), meta.get("manifest", []), run_dir)
 
 
 @app.get("/api/projects/{pid}/history")
