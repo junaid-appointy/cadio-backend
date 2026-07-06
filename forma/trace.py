@@ -17,11 +17,15 @@ import json
 from pathlib import Path
 
 
-def trace_polygons(image_path: Path, max_points: int = 240) -> dict:
+def trace_polygons(image_path: Path, max_points: int = 400) -> dict:
     """Trace an image into normalized polygons with holes.
     Returns {"polys": [{"outer": [[x,y],...], "holes": [[[x,y],...],...]}, ...],
              "aspect": h/w}. Coordinates are normalized so width spans 0..1,
-    y up. Raises ValueError if nothing traceable is found."""
+    y up. Raises ValueError if nothing traceable is found.
+
+    Quality: the source (a small icon) is UPSCALED and blurred before
+    thresholding so the pixel staircase becomes a smooth boundary; contours are
+    lightly smoothed and simplified with enough points to keep curves round."""
     import cv2
     import numpy as np
 
@@ -29,18 +33,27 @@ def trace_polygons(image_path: Path, max_points: int = 240) -> dict:
     if img is None:
         raise ValueError("could not read image")
 
-    # foreground mask
-    if img.ndim == 3 and img.shape[2] == 4:
-        # RGBA: prefer alpha (the logo is the opaque part)
-        alpha = img[:, :, 3]
-        if alpha.min() < 250:  # a real alpha channel
-            mask = (alpha > 100).astype("uint8") * 255
-        else:
-            mask = _threshold_luma(img[:, :, :3])
-    elif img.ndim == 3:
-        mask = _threshold_luma(img[:, :, :3])
+    # a grayscale "foreground-ness" field at native resolution
+    if img.ndim == 3 and img.shape[2] == 4 and img[:, :, 3].min() < 250:
+        field = img[:, :, 3]  # real alpha: the logo is the opaque part
+        invert = False
     else:
-        mask = _threshold_luma(img)
+        rgb = img[:, :, :3] if img.ndim == 3 else img
+        field = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY) if rgb.ndim == 3 else rgb
+        invert = None  # decide by Otsu below
+
+    # upscale (min side ~700) + blur → smooth, anti-aliased edges
+    h0, w0 = field.shape
+    scale = max(1.0, 700.0 / min(h0, w0))
+    field = cv2.resize(field, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_CUBIC)
+    field = cv2.GaussianBlur(field, (0, 0), sigmaX=max(1.5, scale))
+
+    if invert is None:
+        _, mask = cv2.threshold(field, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if mask.mean() > 127:  # foreground ended up as most of the image → flip
+            mask = 255 - mask
+    else:
+        _, mask = cv2.threshold(field, 100, 255, cv2.THRESH_BINARY)
 
     H, W = mask.shape
     contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -74,28 +87,39 @@ def trace_polygons(image_path: Path, max_points: int = 240) -> dict:
     if total > max_points:
         polys = _decimate(polys, max_points)
 
-    return {"polys": polys, "aspect": H / W}
+    # re-normalize so the LOGO's bounding box (not the padded image) maps to
+    # width 0..1 — so width_mm sizes the actual graphic, and padding is cropped
+    xs = [pt[0] for p in polys for pt in p["outer"]]
+    ys = [pt[1] for p in polys for pt in p["outer"]]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    lw = (maxx - minx) or 1.0
 
+    def remap(pt):
+        return [(pt[0] - minx) / lw, (pt[1] - miny) / lw]
 
-def _threshold_luma(bgr):
-    import cv2
+    for p in polys:
+        p["outer"] = [remap(pt) for pt in p["outer"]]
+        p["holes"] = [[remap(pt) for pt in h] for h in p["holes"]]
 
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    # Otsu split; the logo is usually the brighter part on a dark tile. If the
-    # "foreground" ends up being most of the image, invert (light background).
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if mask.mean() > 127:
-        mask = 255 - mask
-    return mask
+    return {"polys": polys, "aspect": (maxy - miny) / lw}
 
 
 def _simplify(contour, W, H):
     import cv2
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
 
-    eps = 0.004 * cv2.arcLength(contour, True)
-    pts = cv2.approxPolyDP(contour, eps, True).reshape(-1, 2)
+    pts = contour.reshape(-1, 2).astype(float)
+    # smooth the boundary along its length (periodic) to round the staircase
+    if len(pts) > 12:
+        sig = max(1.5, len(pts) * 0.01)
+        pts[:, 0] = gaussian_filter1d(pts[:, 0], sig, mode="wrap")
+        pts[:, 1] = gaussian_filter1d(pts[:, 1], sig, mode="wrap")
+    # simplify, keeping enough points that curves stay round
+    eps = 0.0015 * cv2.arcLength(pts.astype(np.float32).reshape(-1, 1, 2), True)
+    simp = cv2.approxPolyDP(pts.astype(np.float32).reshape(-1, 1, 2), eps, True).reshape(-1, 2)
     # normalize: x in 0..1 across the width, y up
-    return [[float(x) / W, float(H - y) / W] for x, y in pts]
+    return [[float(x) / W, float(H - y) / W] for x, y in simp]
 
 
 def _decimate(polys, max_points):
