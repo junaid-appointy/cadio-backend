@@ -1,8 +1,8 @@
-"""Forma web API — the product surface.
+"""CADIO web API — the product surface.
 
 Everything is project-scoped. Runs, references, and conversation all belong to
-a project and persist in SQLite (~/.forma/forma.db); files live under
-~/.forma/projects/<pid>/. Conversations resume across reload and restart
+a project and persist in SQLite (~/.cadio/cadio.db); files live under
+~/.cadio/projects/<pid>/. Conversations resume across reload and restart
 because the orchestrator's memory is rebuilt from stored messages.
 
 REST:
@@ -66,7 +66,7 @@ IMAGE_MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
 # reference geometry: agent measures these with inspect_geometry (not shown as images)
 GEOMETRY_EXTS = {".step": "model/step", ".stp": "model/step", ".stl": "model/stl"}
 
-app = FastAPI(title="Forma", version="0.1.0")
+app = FastAPI(title="CADIO", version="0.1.0")
 engine = PrecisionEngine()
 store = Store()
 
@@ -77,7 +77,7 @@ auth.configure(store)
 app.add_middleware(
     SessionMiddleware,
     secret_key=auth.session_secret(),
-    session_cookie="forma_session",
+    session_cookie="cadio_session",
     max_age=30 * 24 * 3600,
     same_site="lax",
     https_only=auth.cookie_secure(),
@@ -89,13 +89,13 @@ app.add_middleware(limits.BodyLimitMiddleware)
 # Developer-only diagnostics. These logs are for us (server console), never shown
 # to users — the UI only ever gets generalized messages. uvicorn doesn't touch the
 # root logger, so we give ours its own handler and keep it off root (no double
-# lines). Set FORMA_LOG_LEVEL=DEBUG to trace every socket message when hunting a bug.
-log = logging.getLogger("forma.api")
+# lines). Set CADIO_LOG_LEVEL=DEBUG to trace every socket message when hunting a bug.
+log = logging.getLogger("cadio.api")
 if not log.handlers:
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] forma: %(message)s", "%H:%M:%S"))
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] cadio: %(message)s", "%H:%M:%S"))
     log.addHandler(_handler)
-    log.setLevel(os.environ.get("FORMA_LOG_LEVEL", "INFO").upper())
+    log.setLevel(os.environ.get("CADIO_LOG_LEVEL", "INFO").upper())
     log.propagate = False
 
 
@@ -297,7 +297,7 @@ class SelectRequest(BaseModel):
 @app.post("/api/projects/{pid}/runs/{run_id}/select")
 def run_select(pid: str, run_id: str, req: SelectRequest, user: dict = Depends(get_current_user)):
     """Resolve a clicked facet into a highlightable face region + a stable,
-    agent-facing description of the part it belongs to (see forma/select.py)."""
+    agent-facing description of the part it belongs to (see cadio/select.py)."""
     require_project(pid, user)
     run = store.get_run(pid, run_id)
     if not run:

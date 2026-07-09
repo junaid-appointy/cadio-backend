@@ -1,7 +1,7 @@
 """The agent loop: any LLM + tools -> validated parametric models.
 
 Provider-agnostic via LiteLLM: the same loop runs on Claude, GPT, Gemini,
-Grok, etc. Pick the model with FORMA_MODEL (or --model on the CLI); API keys
+Grok, etc. Pick the model with CADIO_MODEL (or --model on the CLI); API keys
 come from each provider's standard env var:
 
     anthropic/claude-opus-4-8      ANTHROPIC_API_KEY   (default)
@@ -31,7 +31,7 @@ import litellm
 from .corpus import system_corpus
 from ..engines.base import Engine
 
-DEFAULT_MODEL = os.environ.get("FORMA_MODEL", "anthropic/claude-opus-4-8")
+DEFAULT_MODEL = os.environ.get("CADIO_MODEL", "anthropic/claude-opus-4-8")
 
 TOOLS = [
     {
@@ -169,7 +169,7 @@ class Orchestrator:
         self.trace_asset = trace_asset
         self.on_event = on_event
         # on_message(role, record): fired as each message is appended, in a
-        # base64-free persistence shape (see forma/api/history.py). Lets the
+        # base64-free persistence shape (see cadio/api/history.py). Lets the
         # shell write conversation history to the DB in real time.
         self.on_message = on_message
         self.messages: list[dict[str, Any]] = []
@@ -210,7 +210,7 @@ class Orchestrator:
 
     def _system_prompt(self) -> str:
         return (
-            "You are Forma, an AI agent that turns user intent into accurate, "
+            "You are CADIO, an AI agent that turns user intent into accurate, "
             "parametric, exportable 3D models. You never click a GUI — you write "
             "programs that the engine executes, then you inspect the measured "
             "results and iterate until the validation report is clean and the "

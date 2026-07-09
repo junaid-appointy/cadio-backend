@@ -1,14 +1,14 @@
 """Runtime data locations.
 
-Everything Forma writes at runtime (the project database, run artifacts,
-uploaded references, sandbox caches) lives OUTSIDE the repo, under ~/.forma
-(override with FORMA_HOME). This is load-bearing: dev servers watch the repo
+Everything CADIO writes at runtime (the project database, run artifacts,
+uploaded references, sandbox caches) lives OUTSIDE the repo, under ~/.cadio
+(override with CADIO_HOME). This is load-bearing: dev servers watch the repo
 for changes, and any runtime write inside it restarts the server
 mid-conversation.
 
 Layout (Track A):
-  ~/.forma/
-    forma.db                       SQLite: projects, messages, runs, assets
+  ~/.cadio/
+    cadio.db                       SQLite: projects, messages, runs, assets
     projects/<pid>/runs/<run_id>/  run artifacts (stl/step/glb/program.py)
     projects/<pid>/refs/<file>     uploaded reference images
     previews/                      ephemeral slider-preview scratch (global)
@@ -23,7 +23,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Load a local .env (GOOGLE_CLIENT_ID/SECRET, FORMA_SESSION_SECRET, provider keys)
+# Load a local .env (GOOGLE_CLIENT_ID/SECRET, CADIO_SESSION_SECRET, provider keys)
 # before anything reads os.environ. config is imported early everywhere, so this
 # runs ahead of auth.py's module-level credential lookup. Best-effort.
 try:
@@ -32,8 +32,8 @@ try:
 except Exception:
     pass
 
-DATA_DIR = Path(os.environ.get("FORMA_HOME", Path.home() / ".forma"))
-DB_PATH = DATA_DIR / "forma.db"
+DATA_DIR = Path(os.environ.get("CADIO_HOME", Path.home() / ".cadio"))
+DB_PATH = DATA_DIR / "cadio.db"
 PROJECTS_DIR = DATA_DIR / "projects"
 PREVIEW_DIR = DATA_DIR / "previews"
 SANDBOX_HOME = DATA_DIR / "sandbox_home"
@@ -56,7 +56,7 @@ def project_refs_dir(pid: str) -> Path:
 
 
 def _migrate_repo_leftover(old: Path, new: Path) -> None:
-    """One-time move of pre-~/.forma data written inside the repo."""
+    """One-time move of pre-~/.cadio data written inside the repo."""
     if not old.is_dir() or new.exists():
         return
     try:
@@ -66,7 +66,7 @@ def _migrate_repo_leftover(old: Path, new: Path) -> None:
         pass  # cross-device or permission issue — start fresh instead
 
 
-# pull any data still sitting in the repo out to ~/.forma (older installs)
+# pull any data still sitting in the repo out to ~/.cadio (older installs)
 _migrate_repo_leftover(REPO_ROOT / "runs", LEGACY_RUNS_DIR)
 _migrate_repo_leftover(REPO_ROOT / "assets", LEGACY_ASSETS_DIR)
 _migrate_repo_leftover(REPO_ROOT / ".sandbox_home", SANDBOX_HOME)

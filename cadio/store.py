@@ -6,7 +6,7 @@ reads never block. The worker pool never touches the DB.
 
 Message records are stored in a persistence-friendly, base64-free shape (user
 messages reference image assets by id, not inline data) so the same rows drive
-both LLM-history replay and UI scrollback — see forma/api/history.py.
+both LLM-history replay and UI scrollback — see cadio/api/history.py.
 """
 
 from __future__ import annotations

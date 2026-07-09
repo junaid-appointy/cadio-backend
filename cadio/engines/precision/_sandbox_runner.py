@@ -22,7 +22,7 @@ _module_counter = itertools.count()
 def load_program(path: Path):
     # unique module name per load: a warm worker serves many jobs and must
     # never hand one job a previous job's module
-    name = f"forma_program_{next(_module_counter)}"
+    name = f"cadio_program_{next(_module_counter)}"
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

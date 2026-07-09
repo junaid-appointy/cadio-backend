@@ -42,7 +42,7 @@ under the cursor.
 ## Fix plan
 
 ### A. Sandbox: emit smooth-region groups (the "part" the user means)
-In `forma/engines/precision/_sandbox_runner.py`, extend `write_face_map`:
+In `cadio/engines/precision/_sandbox_runner.py`, extend `write_face_map`:
 1. Build edge→faces adjacency with `TopExp.MapShapesAndAncestors_s(part.wrapped,
    TopAbs_EDGE, TopAbs_FACE, ...)`.
 2. For each shared edge, measure the dihedral angle between the two faces

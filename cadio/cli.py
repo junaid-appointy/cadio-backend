@@ -1,8 +1,8 @@
-"""Forma CLI.
+"""CADIO CLI.
 
-  uv run forma            # start the web app (the one command you need)
-  uv run forma run examples/simple_box.py --set length=200   # run a program
-  uv run forma chat       # terminal agent session
+  uv run cadio            # start the web app (the one command you need)
+  uv run cadio run examples/simple_box.py --set length=200   # run a program
+  uv run cadio chat       # terminal agent session
 """
 
 from __future__ import annotations
@@ -22,13 +22,13 @@ CLI_RUNS = config.DATA_DIR / "cli-runs"
 
 def cmd_serve(args) -> int:
     """Start the web app. Auto-reload is on and safe (all runtime data lives in
-    ~/.forma, outside the repo, so builds never trigger the reloader). Watches
-    only the forma/ package."""
+    ~/.cadio, outside the repo, so builds never trigger the reloader). Watches
+    only the cadio/ package."""
     import uvicorn
 
-    print(f"\n  forma → http://{args.host}:{args.port}\n")
+    print(f"\n  cadio → http://{args.host}:{args.port}\n")
     uvicorn.run(
-        "forma.api.app:app",
+        "cadio.api.app:app",
         host=args.host,
         port=args.port,
         reload=not args.no_reload,
@@ -73,7 +73,7 @@ def cmd_chat(args) -> int:
     from .agent.orchestrator import Orchestrator
 
     orch = Orchestrator(PrecisionEngine(), CLI_RUNS, model=args.model)
-    print(f"Forma agent ({orch.model}). Describe the part you need. /quit to exit.\n")
+    print(f"CADIO agent ({orch.model}). Describe the part you need. /quit to exit.\n")
     while True:
         try:
             user = input("you> ").strip()
@@ -84,13 +84,13 @@ def cmd_chat(args) -> int:
         if user in ("/quit", "/exit"):
             return 0
         reply = orch.send(user)
-        print(f"\nforma> {reply}\n")
+        print(f"\ncadio> {reply}\n")
         if orch.last_run_dir:
             print(f"(latest artifacts in {orch.last_run_dir})\n")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="forma")
+    parser = argparse.ArgumentParser(prog="cadio")
     sub = parser.add_subparsers(dest="command")
 
     p_serve = sub.add_parser("serve", help="run the web app (default)")
@@ -107,11 +107,11 @@ def main() -> int:
     p_run.set_defaults(func=cmd_run)
 
     p_chat = sub.add_parser("chat", help="terminal agent session")
-    p_chat.add_argument("--model", help="LLM in LiteLLM format (default: $FORMA_MODEL "
+    p_chat.add_argument("--model", help="LLM in LiteLLM format (default: $CADIO_MODEL "
                         "or anthropic/claude-opus-4-8)")
     p_chat.set_defaults(func=cmd_chat)
 
-    # `forma` with no subcommand starts the web app (the default)
+    # `cadio` with no subcommand starts the web app (the default)
     argv = sys.argv[1:]
     known = {"serve", "run", "chat", "-h", "--help"}
     if not argv or argv[0] not in known:

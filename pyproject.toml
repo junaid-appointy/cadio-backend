@@ -1,7 +1,7 @@
 [project]
-name = "forma"
+name = "cadio"
 version = "0.0.1"
-description = "AI-agent 3D design platform — generic shell + pluggable geometry engines"
+description = "CADIO — AI-native 3D creation platform: generic shell + pluggable geometry engines"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "build123d",
@@ -22,11 +22,11 @@ dependencies = [
 ]
 
 [project.scripts]
-forma = "forma.cli:main"
+cadio = "cadio.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["forma*"]
+include = ["cadio*"]

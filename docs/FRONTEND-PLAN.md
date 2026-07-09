@@ -1,4 +1,4 @@
-# Forma frontend — quality plan
+# CADIO frontend — quality plan
 
 > Written 2026-07-03. Goal: take the workspace from "working slice" to a
 > robust, high-quality product surface. Items are grouped into three phases;
@@ -145,7 +145,7 @@ agent-side structured intent tracking — coordinate with backend corpus work.)
 Upload reference photos in chat (vision models); drag-and-drop, 📎 button,
 reusable 🖼 reference library (re-attach any earlier upload at any time),
 thumbnails in messages, multimodal via LiteLLM. Also landed early from 2.2:
-ws auto-reconnect with backoff, and the `forma serve` reload fix.
+ws auto-reconnect with backoff, and the `cadio serve` reload fix.
 
 ### 3.4 Recipe export & sharing prep
 "Export recipe" (zip: program + params + intent + meta) so no model is a

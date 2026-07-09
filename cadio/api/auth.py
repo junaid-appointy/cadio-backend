@@ -7,12 +7,12 @@ by reading `ws.session["uid"]` (see app.ws_chat).
 
 Config (env):
   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET   OAuth credentials (auth is OFF if unset)
-  FORMA_SESSION_SECRET                       cookie signing key (REQUIRED in prod)
-  FORMA_ALLOWED_EMAILS / FORMA_ALLOWED_DOMAIN optional beta allowlist (else open —
+  CADIO_SESSION_SECRET                       cookie signing key (REQUIRED in prod)
+  CADIO_ALLOWED_EMAILS / CADIO_ALLOWED_DOMAIN optional beta allowlist (else open —
                                              gate via Google Console test users)
 
 When Google creds are unset, auth is disabled and every request runs as a single
-local "dev" user — so `uv run forma` works out of the box with no OAuth setup.
+local "dev" user — so `uv run cadio` works out of the box with no OAuth setup.
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-log = logging.getLogger("forma.api")
+log = logging.getLogger("cadio.api")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 
-_ALLOWED_EMAILS = {e.strip().lower() for e in os.environ.get("FORMA_ALLOWED_EMAILS", "").split(",") if e.strip()}
-_ALLOWED_DOMAIN = (os.environ.get("FORMA_ALLOWED_DOMAIN", "").strip().lower() or None)
+_ALLOWED_EMAILS = {e.strip().lower() for e in os.environ.get("CADIO_ALLOWED_EMAILS", "").split(",") if e.strip()}
+_ALLOWED_DOMAIN = (os.environ.get("CADIO_ALLOWED_DOMAIN", "").strip().lower() or None)
 
 # set by app.py at import time so the dependencies can reach the Store without a
 # circular import (app imports auth, not the reverse)
@@ -49,16 +49,16 @@ def auth_enabled() -> bool:
 
 
 def session_secret() -> str:
-    s = os.environ.get("FORMA_SESSION_SECRET")
+    s = os.environ.get("CADIO_SESSION_SECRET")
     if s:
         return s
-    log.warning("FORMA_SESSION_SECRET is not set — using a random per-boot secret; "
+    log.warning("CADIO_SESSION_SECRET is not set — using a random per-boot secret; "
                 "sessions won't survive a restart. Set it in production.")
     return secrets.token_urlsafe(32)
 
 
 def cookie_secure() -> bool:
-    env = os.environ.get("FORMA_COOKIE_SECURE")
+    env = os.environ.get("CADIO_COOKIE_SECURE")
     if env is not None:
         return env.lower() in ("1", "true", "yes")
     return auth_enabled()  # default: secure in prod (creds set), lax for local dev
@@ -92,10 +92,10 @@ async def login(request: Request):
         return JSONResponse({"error": "auth is not configured"}, status_code=503)
     # In dev the app is served by Vite on a different origin (5173) than the API
     # (8000); the OAuth round-trip must land back on the FRONTEND origin so the
-    # session cookie is set there. FORMA_OAUTH_REDIRECT_URI pins that explicitly
+    # session cookie is set there. CADIO_OAUTH_REDIRECT_URI pins that explicitly
     # (and must exactly match a URI registered in Google Console). Same-origin in
     # prod → the request-derived URL is already correct, so the env var is optional.
-    redirect_uri = os.environ.get("FORMA_OAUTH_REDIRECT_URI") or str(request.url_for("auth_callback"))
+    redirect_uri = os.environ.get("CADIO_OAUTH_REDIRECT_URI") or str(request.url_for("auth_callback"))
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 

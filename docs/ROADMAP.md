@@ -1,4 +1,4 @@
-# Forma roadmap — from vertical slice to professional tool
+# CADIO roadmap — from vertical slice to professional tool
 
 > Written 2026-07-03, agreed direction: **A → B → C.** This is the execution
 > plan for the next phase; the product-level spec (shell + pluggable engines,
@@ -40,7 +40,7 @@ formats. "Professional" concretely means:
 server RAM (reload/restart = amnesia); references are global. The user cannot
 tell what belongs together, resume work, or share "a project."
 
-### A1. Data layer — SQLite at `~/.forma/forma.db`
+### A1. Data layer — SQLite at `~/.cadio/cadio.db`
 
 ```sql
 projects(id TEXT PK, name TEXT, created_at, updated_at, archived_at NULL)
@@ -52,9 +52,9 @@ assets(id TEXT PK, project_id FK, file TEXT, name TEXT, mime TEXT, created_at)
 ```
 
 - WAL mode; single writer via a small `store.py` module (stdlib `sqlite3`).
-- Run/asset **files** stay on disk (`~/.forma/projects/<id>/runs/...`,
+- Run/asset **files** stay on disk (`~/.cadio/projects/<id>/runs/...`,
   `.../refs/...`); DB holds metadata. meta.json files retired.
-- **Migration:** existing flat `~/.forma/runs/*` and `assets/*` move into an
+- **Migration:** existing flat `~/.cadio/runs/*` and `assets/*` move into an
   auto-created project named "Unsorted imports"; nothing is deleted.
 
 ### A2. Backend — project-scoped everything
@@ -141,13 +141,13 @@ at least one flaw found via its own renders.
 nature. The plan's answer is the generalist engine: headless Blender (bpy).
 
 ### C1. Engine plumbing (the contract earns its keep)
-- `forma/engines/blender/`: implements the same `Engine` interface —
+- `cadio/engines/blender/`: implements the same `Engine` interface —
   `execute(code, params, run_dir, preview)` runs a **bpy program**
   (`PARAMS` + `build(params)` building a scene/object), exports STL + GLB.
 - Worker: persistent `blender --background --python worker_loop.py` process
   pool (same stdio-JSON protocol as the precision pool; imports cost ~2-4s
   once). Blender binary: autodetect (`/Applications/Blender.app/...`,
-  `$FORMA_BLENDER`), clear error if missing.
+  `$CADIO_BLENDER`), clear error if missing.
 - Validation: manifold check via existing mesh gate (print path) OR poly/
   material budget (asset path) — engine picks profile by declared intent.
 - Checkpoint artifact: **turntable renders** (Blender EEVEE, 4–8 frames) fed

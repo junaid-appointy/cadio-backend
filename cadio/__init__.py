@@ -1,4 +1,4 @@
-"""Forma — AI-agent 3D design platform.
+"""CADIO — AI-agent 3D design platform.
 
 Generic shell + pluggable geometry engines. See docs/PROJECT.md.
 """

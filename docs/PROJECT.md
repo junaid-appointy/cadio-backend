@@ -1,4 +1,4 @@
-# Forma — living build doc
+# CADIO — living build doc
 
 > Source-of-truth section first (always current); build log below; learnings at
 > the end. Product spec: `../../ai-3d-product-plan.md` (v2, shell + engines).
@@ -7,10 +7,10 @@
 
 **Phase:** 0 (shell skeleton + Engine 1 vertical slice). **Working end to end:**
 
-- **Engine contract** (`forma/engines/base.py`): `execute(code, params, run_dir)
+- **Engine contract** (`cadio/engines/base.py`): `execute(code, params, run_dir)
   -> ExecutionResult` (manifest, artifacts, measured bbox/volume, validation).
   Engines are plugins; the shell never imports engine internals.
-- **Engine 1 — precision** (`forma/engines/precision/`): build123d 0.11 /
+- **Engine 1 — precision** (`cadio/engines/precision/`): build123d 0.11 /
   OCCT on Python 3.12 (`uv venv .venv`). **Warm worker pool** (`pool.py`):
   resident `python -I` workers with the kernel pre-imported serve jobs over
   stdio — rebuilds ≈20ms vs ≈6s cold; workers are replaced on death/timeout
@@ -19,20 +19,20 @@
   Stripped env, 90s wall clock, per-run output dir. Known caveat: a worker
   serves many jobs, so a hostile program could poison its own worker —
   superseded by the Docker sandbox (P1).
-- **Validation gate v1** (`forma/validation/mesh.py`): watertight, winding,
+- **Validation gate v1** (`cadio/validation/mesh.py`): watertight, winding,
   positive volume, mesh-bbox vs BREP-bbox cross-check (catches export bugs).
 - **Program contract:** `PARAMS` list (name/default/min/max/unit/group) +
   `build(params) -> Part`; requirement asserts inside `build()`. Slider
   re-execution never calls the LLM.
-- **Agent** (`forma/agent/orchestrator.py`): **provider-agnostic via LiteLLM**
+- **Agent** (`cadio/agent/orchestrator.py`): **provider-agnostic via LiteLLM**
   — one OpenAI-format tool loop runs on Anthropic, OpenAI, Gemini, xAI/Grok,
-  etc. Model from `FORMA_MODEL` env or `chat --model provider/model-id`
+  etc. Model from `CADIO_MODEL` env or `chat --model provider/model-id`
   (default `anthropic/claude-opus-4-8`); keys from each provider's standard
   env var (ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / XAI_API_KEY).
   Tools = `run_cad` (execute+validate, returns measured facts) and `ask_user`
   (batched Q&A, defaults). System prompt = program contract + corpus seed
-  (`agent/corpus.py`). CLI REPL: `python -m forma.cli chat`.
-- **Web workspace — the primary surface** (`forma/api/app.py` + `frontend/`,
+  (`agent/corpus.py`). CLI REPL: `python -m cadio.cli chat`.
+- **Web workspace — the primary surface** (`cadio/api/app.py` + `frontend/`,
   a **React 19 + TypeScript + Vite** app using @react-three/fiber + drei):
   three panes — chat / 3D viewer / tabbed side panel (Params · Code · Runs).
   Dev: `npm run dev` in `frontend/` (proxies /api, /runs, /ws to uvicorn on
@@ -82,7 +82,7 @@ superseded by Track A.
 
 **2026-07-06 — parameter → affected-geometry highlighting.** Click a parameter
 in the Params panel and the faces it controls glow cyan in the viewer.
-Mechanism (`forma/affect.py`): there's no stored param→face mapping (the number
+Mechanism (`cadio/affect.py`): there's no stored param→face mapping (the number
 flows through arbitrary build123d code), so we discover it empirically — nudge
 the one parameter, rebuild (warm preview, ~20-50ms), and diff the meshes.
 Symmetric diff via trimesh nearest-surface (needs `rtree`): base faces that
@@ -95,10 +95,10 @@ artifacts; `GET /…/runs/{id}/affect` serves the cache or computes on demand.
 Highlight applies only to the stable saved model, not live slider previews.
 
 **2026-07-03 — Track A (projects/persistence) + Track B (Engine-1 pro).**
-*Track A:* SQLite store (`forma/store.py`: projects/messages/runs/assets, WAL,
-single-writer lock); all data under `~/.forma/projects/<pid>/`; project-scoped
+*Track A:* SQLite store (`cadio/store.py`: projects/messages/runs/assets, WAL,
+single-writer lock); all data under `~/.cadio/projects/<pid>/`; project-scoped
 API; **websocket conversation resume** — the orchestrator's LLM history is
-rebuilt from stored messages via one serializer (`forma/api/history.py`) that
+rebuilt from stored messages via one serializer (`cadio/api/history.py`) that
 also drives UI scrollback, so the agent genuinely remembers across reload and
 restart. React project **home + router** (`/`, `/p/<pid>`), inline project
 rename, SPA-fallback route. Legacy flat runs/assets auto-migrate into an
@@ -106,7 +106,7 @@ rename, SPA-fallback route. Legacy flat runs/assets auto-migrate into an
 *Track B:* **B1** corpus depth — verified recipes for revolve, shell, loft,
 sweep (perpendicular-plane), fillet/chamfer, polar/grid patterns, splines
 (each executed through the engine before entering the corpus); program
-contract now blesses builder mode. **B2 agent eyes** — `forma/render.py`
+contract now blesses builder mode. **B2 agent eyes** — `cadio/render.py`
 renders 4 views (matplotlib Agg, headless) per non-preview run; the
 orchestrator feeds them to vision models as a post-build user message so the
 agent critiques SHAPE before presenting (gated by `litellm.supports_vision`;
@@ -141,7 +141,7 @@ check confirms the dark theme renders as designed.
 - **Root-caused the mid-conversation disconnects:** `uvicorn --reload` watches
   the whole repo, so the engine writing `runs/*/program.py` triggered a server
   restart, killing the websocket (visible in the user's log). Fix: `python -m
-  forma.cli serve --reload` watches only the `forma/` package. Frontend also
+  cadio.cli serve --reload` watches only the `cadio/` package. Frontend also
   gained **auto-reconnect** (5 attempts, backoff, re-sends init with model+key)
   with an honest note that a server restart resets the agent's conversation.
 - **Reference images:** `POST/GET /api/assets` (15MB cap, image mimes only,
@@ -201,8 +201,8 @@ slice verified end to end (CLI + API + viewer).
   redesign around a watertight failure that the cleaner handles, and gained
   the engraving recipe (`extrude(Text(...), amount=...)`, overshoot the cut).
 
-- **Runtime data must live outside the repo** (`~/.forma`, override
-  `FORMA_HOME`). The first "fix" for reload-disconnects was a safer serve
+- **Runtime data must live outside the repo** (`~/.cadio`, override
+  `CADIO_HOME`). The first "fix" for reload-disconnects was a safer serve
   command — but users keep typing the command they know (`uvicorn --reload`),
   which watches the repo and restarted the server whenever the engine wrote
   `runs/*/program.py`. A fix that requires changing habits isn't a fix; now

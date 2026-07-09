@@ -19,7 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .auth import get_current_user
 
-DAILY_RUN_QUOTA = int(os.environ.get("FORMA_DAILY_RUN_QUOTA", "300"))
+DAILY_RUN_QUOTA = int(os.environ.get("CADIO_DAILY_RUN_QUOTA", "300"))
 MAX_BODY_BYTES = 50 * 1024 * 1024  # nginx enforces this too; belt-and-suspenders
 
 

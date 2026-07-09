@@ -34,7 +34,7 @@ def _shaded_faces(mesh) -> np.ndarray:
     normals = np.asarray(mesh.face_normals)
     lit = np.clip(normals @ _LIGHT, 0.0, 1.0)
     shade = 0.35 + 0.65 * lit  # ambient floor so back faces aren't black
-    base = np.array([0.91, 0.70, 0.29])  # forma gold
+    base = np.array([0.91, 0.70, 0.29])  # cadio gold
     return np.clip(shade[:, None] * base[None, :], 0, 1)
 
 
