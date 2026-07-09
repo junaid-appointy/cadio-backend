@@ -9,7 +9,7 @@ scrollback never drift apart on resume.
 
 Stored record shapes (role -> content JSON):
   user      {"text": str, "image_asset_ids": [id, ...]}
-  assistant {"content": str, "tool_calls": [...]}          # LLM-native
+  assistant {"content": str, "tool_calls": [...], "usage": {...}?}  # usage on the final msg
   tool      {"tool_call_id": str, "content": str}          # LLM-native
   event     {"kind": "run", "run_id": str}                 # UI-only marker
 """
@@ -70,7 +70,10 @@ def to_ui_items(records: list[dict], run_lookup: Callable[[str], dict | None],
         elif role == "assistant":
             text = (content.get("content") or "").strip()
             if text:
-                items.append({"kind": "agent", "text": text})
+                item = {"kind": "agent", "text": text}
+                if content.get("usage"):  # token/cost/time attached to the final message
+                    item["usage"] = content["usage"]
+                items.append(item)
         elif role == "event" and content.get("kind") == "run":
             meta = run_lookup(content["run_id"])
             if meta:

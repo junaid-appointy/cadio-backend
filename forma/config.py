@@ -23,6 +23,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Load a local .env (GOOGLE_CLIENT_ID/SECRET, FORMA_SESSION_SECRET, provider keys)
+# before anything reads os.environ. config is imported early everywhere, so this
+# runs ahead of auth.py's module-level credential lookup. Best-effort.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(REPO_ROOT / ".env")
+except Exception:
+    pass
+
 DATA_DIR = Path(os.environ.get("FORMA_HOME", Path.home() / ".forma"))
 DB_PATH = DATA_DIR / "forma.db"
 PROJECTS_DIR = DATA_DIR / "projects"

@@ -66,6 +66,7 @@ class ExecutionResult:
     volume_mm3: float | None = None
     validation: ValidationReport | None = None
     error: str | None = None  # traceback / message when ok is False
+    duration_s: float | None = None  # wall-clock time the build took (pool + export + render)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class ExecutionResult:
             "volume_mm3": self.volume_mm3,
             "validation": self.validation.to_dict() if self.validation else None,
             "error": self.error,
+            "duration_s": self.duration_s,
         }
 
 

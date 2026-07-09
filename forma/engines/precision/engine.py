@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,12 @@ A precision-engine program is a Python file using build123d (algebra mode) that 
     "unit": "mm", "description": "Outer length", "group": "Size"}
    Every dimension that came from the user's requirements MUST be a parameter,
    never a magic number inside build().
+   Parameter names MUST be unique (a duplicate name fails the build). For a
+   REPEATED feature (4 wheels, 6 holes, N switches) declare ONE integer count
+   parameter plus SHARED dimension parameters (e.g. `wheel_count`, `wheel_diameter`)
+   and place the instances in a loop inside build() — never `wheel_1_*`,
+   `wheel_2_*`. Give numeric params a real `min`/`max` so the UI shows a slider,
+   and a per-feature `group` so related knobs cluster.
 
 2. `build(params: dict) -> Part` — pure function from parameter values to a
    single solid. Units are millimetres. Two styles, both fine (return a Part):
@@ -53,6 +60,19 @@ A precision-engine program is a Python file using build123d (algebra mode) that 
    Assert requirement facts inside build() with plain `assert` statements
    (e.g. `assert cavity_depth >= 32.4, "clearance under plate"`) so violated
    requirements fail loudly instead of producing wrong geometry.
+
+3. `features(part, params) -> dict[str, faces]` — OPTIONAL. Name the parts a
+   user is likely to point at, so a click in the viewer resolves to a stable name
+   ("make `left_boss` taller") that survives rebuilds. Map each name to the
+   face(s) it covers, selected from the built part, e.g.:
+     from build123d import GeomType
+     def features(part, params):
+         return {
+             "spout": part.faces().filter_by(GeomType.CYLINDER),
+             "base":  part.faces().sort_by(Axis.Z)[0],
+         }
+   Values may be a Face, a ShapeList, or a list of Faces. Prefer stable, semantic
+   names for the salient features; leave incidental faces unnamed.
 
 The runner (not your code) handles export, measurement, and validation.
 Do not import anything except build123d, math, and dataclasses.
@@ -84,6 +104,7 @@ class PrecisionEngine:
     ) -> ExecutionResult:
         # absolute: subprocesses run with cwd inside the sandbox, so relative
         # paths would resolve inside themselves
+        t0 = time.perf_counter()
         run_dir = Path(run_dir).resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
         program_path = run_dir / "program.py"
@@ -108,9 +129,12 @@ class PrecisionEngine:
                 return ExecutionResult(
                     ok=False, run_dir=run_dir,
                     error=f"execution failed or timed out after {self.timeout_s}s",
+                    duration_s=round(time.perf_counter() - t0, 2),
                 )
 
-        return self._postprocess(raw, run_dir, preview)
+        result = self._postprocess(raw, run_dir, preview)
+        result.duration_s = round(time.perf_counter() - t0, 2)  # honest wall clock the user waited
+        return result
 
     def _get_pool(self) -> WorkerPool:
         with self._pool_lock:

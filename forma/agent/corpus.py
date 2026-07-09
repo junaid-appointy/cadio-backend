@@ -220,5 +220,31 @@ a collapsed or non-watertight result; read its message and fix the geometry.
 '''
 
 
+PARAM_RULES = """\
+PARAMETER DESIGN (the PARAMS list — this is how the user tweaks the model):
+- One knob per physical degree of freedom. Every distinct dimension the user
+  might want to change is its OWN named parameter (height, width, wall, hole
+  diameter, fillet radius, spacing...). A model with real editability has many
+  parameters, not few.
+- FORBIDDEN: a single blanket `scale` parameter as the only knob. Uniformly
+  scaling a part is not parametric design — wall thickness, hole sizes, screw
+  clearances, and fillets must NOT scale with overall size (a 2x bigger box
+  still takes an M3 screw). If the user asks to "make it bigger", grow the
+  envelope dimensions, not a multiplier on everything.
+- REPEATED features (4 wheels, 6 mounting holes, N switch gangs): declare ONE
+  integer count parameter (`wheel_count`) plus SHARED dimension parameters
+  (`wheel_diameter`, `wheel_width`) and place the instances in a LOOP inside
+  build(). NEVER declare per-instance params (`wheel_1_diameter, wheel_2_...`):
+  duplicate names fail the build, and per-instance knobs make the model
+  untweakable. This is the MULTI-FEATURE RECIPE pattern above (count + loop).
+- Give every numeric parameter a real-world `min`/`max` (so the UI shows a
+  slider, not a bare box) and a per-feature `group` ("Body", "Wheels",
+  "Mounting") so related knobs cluster instead of forming one flat list.
+- Parameter names must be unique and be valid identifiers; the build fails
+  loudly on a duplicate — read the error and merge the duplicates into a
+  count + shared-dimension pattern.
+"""
+
+
 def system_corpus() -> str:
-    return PROCESS_RULES + "\n" + MODELING_RULES + "\n" + MODELING_RECIPES
+    return PROCESS_RULES + "\n" + MODELING_RULES + "\n" + MODELING_RECIPES + "\n" + PARAM_RULES

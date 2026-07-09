@@ -22,13 +22,22 @@ from typing import Any
 from . import config
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id          TEXT PRIMARY KEY,
+    google_sub  TEXT UNIQUE,
+    email       TEXT UNIQUE NOT NULL,
+    name        TEXT,
+    picture     TEXT,
+    created_at  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS projects (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
     archived_at TEXT,
-    thumb_run   TEXT
+    thumb_run   TEXT,
+    user_id     TEXT              -- owner; NULL for pre-auth projects (adopted by first user)
 );
 CREATE TABLE IF NOT EXISTS messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,31 +89,109 @@ class Store:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        self._migrate_add_project_owner()
         self._migrate_legacy_flat()
+
+    def _migrate_add_project_owner(self) -> None:
+        """Add projects.user_id on databases created before multi-user (the
+        CREATE TABLE above only adds it to fresh DBs). Idempotent."""
+        with self._lock:
+            cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(projects)").fetchall()}
+            if "user_id" not in cols:
+                self._conn.execute("ALTER TABLE projects ADD COLUMN user_id TEXT")
+                self._conn.commit()
+
+    # ---- users ------------------------------------------------------------
+
+    DEV_SUB = "dev-local"  # google_sub of the placeholder used when OAuth is off
+
+    def upsert_user(self, google_sub: str, email: str,
+                    name: str | None = None, picture: str | None = None) -> dict:
+        """Find-or-create the user for a Google identity, refreshing profile fields.
+
+        Project adoption keeps work from being stranded across the dev→Google
+        transition: the local-dev placeholder adopts pre-auth (owner-less)
+        projects, and then the FIRST real Google user inherits BOTH the owner-less
+        projects AND everything the dev placeholder was holding — so signing in
+        with Google for the first time carries all existing history over.
+
+        Portable SQL only (see store docstring): the read-then-write is race-free
+        under the store-wide lock today; the Postgres port keeps it in one pooled
+        transaction."""
+        now = _now()
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT id FROM users WHERE google_sub=?", (google_sub,)).fetchone()
+            if existing:
+                uid = existing["id"]
+                self._conn.execute(
+                    "UPDATE users SET email=?, name=?, picture=? WHERE id=?",
+                    (email, name, picture, uid))
+            else:
+                is_dev = google_sub == self.DEV_SUB
+                any_user = self._conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+                real_user = self._conn.execute(
+                    "SELECT 1 FROM users WHERE google_sub != ? LIMIT 1", (self.DEV_SUB,)).fetchone() is not None
+                uid = _new_id()
+                self._conn.execute(
+                    "INSERT INTO users(id, google_sub, email, name, picture, created_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (uid, google_sub, email, name, picture, now))
+                if is_dev and not any_user:
+                    # local-dev placeholder adopts pre-auth projects
+                    self._conn.execute("UPDATE projects SET user_id=? WHERE user_id IS NULL", (uid,))
+                elif not is_dev and not real_user:
+                    # first real owner inherits owner-less projects + the dev placeholder's
+                    self._conn.execute(
+                        "UPDATE projects SET user_id=? WHERE user_id IS NULL "
+                        "OR user_id IN (SELECT id FROM users WHERE google_sub=?)",
+                        (uid, self.DEV_SUB))
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        return self._user_row(row)
+
+    def get_user(self, uid: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        return self._user_row(row) if row else None
+
+    def _user_row(self, row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "email": row["email"], "name": row["name"],
+                "picture": row["picture"], "created_at": row["created_at"]}
 
     # ---- projects ---------------------------------------------------------
 
-    def create_project(self, name: str) -> dict:
+    def create_project(self, name: str, user_id: str | None = None) -> dict:
         pid = _new_id()
         now = _now()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO projects(id, name, created_at, updated_at) VALUES (?,?,?,?)",
-                (pid, name.strip() or "Untitled project", now, now),
+                "INSERT INTO projects(id, name, created_at, updated_at, user_id) VALUES (?,?,?,?,?)",
+                (pid, name.strip() or "Untitled project", now, now, user_id),
             )
             self._conn.commit()
         config.project_runs_dir(pid).mkdir(parents=True, exist_ok=True)
         config.project_refs_dir(pid).mkdir(parents=True, exist_ok=True)
         return self.get_project(pid)
 
-    def list_projects(self, include_archived: bool = False) -> list[dict]:
-        q = "SELECT * FROM projects"
+    def list_projects(self, user_id: str, include_archived: bool = False) -> list[dict]:
+        q = "SELECT * FROM projects WHERE user_id=?"
         if not include_archived:
-            q += " WHERE archived_at IS NULL"
+            q += " AND archived_at IS NULL"
         q += " ORDER BY updated_at DESC"
         with self._lock:
-            rows = self._conn.execute(q).fetchall()
+            rows = self._conn.execute(q, (user_id,)).fetchall()
         return [self._project_row(r) for r in rows]
+
+    def count_runs_today(self, user_id: str) -> int:
+        """Runs this user created since local midnight — for the daily quota.
+        created_at is ISO local time, so a lexical `>=` range works on any DB."""
+        start = time.strftime("%Y-%m-%dT00:00:00")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) c FROM runs JOIN projects ON runs.project_id = projects.id "
+                "WHERE projects.user_id = ? AND runs.created_at >= ?", (user_id, start)).fetchone()
+        return row["c"]
 
     def get_project(self, pid: str) -> dict | None:
         with self._lock:

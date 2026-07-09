@@ -21,6 +21,7 @@ import json
 import mimetypes
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -173,6 +174,7 @@ class Orchestrator:
         self.on_message = on_message
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
+        self.last_usage: dict[str, Any] | None = None  # token/cost/time of the last turn
         self._turn_renders: list[Path] = []  # renders from the current turn's builds
         self._stop = threading.Event()
 
@@ -213,6 +215,10 @@ class Orchestrator:
             "programs that the engine executes, then you inspect the measured "
             "results and iterate until the validation report is clean and the "
             "geometry matches the requirements.\n\n"
+            "When a message says the user SELECTED a specific part/feature of the "
+            "current model, scope your edit to THAT feature and preserve everything "
+            "else. Define a features() map naming the parts users are likely to "
+            "point at, and keep those names stable across rebuilds.\n\n"
             "ENGINE PROGRAM CONTRACT:\n" + self.engine.program_contract() + "\n\n"
             + system_corpus()
         )
@@ -281,8 +287,27 @@ class Orchestrator:
                                "image_asset_ids": [img["id"] for img in (images or [])]})
         self._turn_renders = []
         self._stop.clear()
+        # per-turn accounting: a turn may make several LLM calls (tool loop)
+        t0 = time.monotonic()
+        tin = tout = calls = 0
+        cost = 0.0
+        cost_ok = True
+
+        def turn_usage() -> dict[str, Any]:
+            return {
+                "input_tokens": tin,
+                "output_tokens": tout,
+                "llm_calls": calls,
+                "cost_usd": round(cost, 4) if cost_ok else None,
+                "duration_s": round(time.monotonic() - t0, 1),
+                "model": self.model,
+            }
+
         while True:
             if self._stop.is_set():
+                if calls:
+                    self.last_usage = turn_usage()
+                    self._emit({"type": "usage", "usage": self.last_usage})
                 return "⏹ Stopped."
             extra = {"api_key": self.api_key} if self.api_key else {}
             # push the model to reason harder about detailed multi-feature parts.
@@ -299,6 +324,16 @@ class Orchestrator:
                 tools=TOOLS,
                 **extra,
             )
+            calls += 1
+            u = getattr(response, "usage", None)
+            if u:
+                tin += int(getattr(u, "prompt_tokens", 0) or 0)
+                tout += int(getattr(u, "completion_tokens", 0) or 0)
+            try:
+                cost += litellm.completion_cost(completion_response=response)
+            except Exception:
+                cost_ok = False  # unknown/self-hosted model — hide the $ figure
+
             msg = response.choices[0].message
             tool_calls = msg.tool_calls or []
 
@@ -316,10 +351,18 @@ class Orchestrator:
                     for tc in tool_calls
                 ]
             self.messages.append(assistant)
-            self._persist("assistant", {"content": assistant["content"],
-                                        "tool_calls": assistant.get("tool_calls")})
+            record: dict[str, Any] = {"content": assistant["content"],
+                                      "tool_calls": assistant.get("tool_calls")}
+            final = not tool_calls
+            if final:
+                # attach usage to the final assistant message so history replay
+                # keeps it, and emit it live (before returning) for the UI
+                self.last_usage = turn_usage()
+                record["usage"] = self.last_usage
+            self._persist("assistant", record)
 
-            if not tool_calls:
+            if final:
+                self._emit({"type": "usage", "usage": self.last_usage})
                 return msg.content or ""
 
             for tc in tool_calls:

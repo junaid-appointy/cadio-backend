@@ -16,6 +16,9 @@ dependencies = [
     "uvicorn[standard]",
     "litellm",
     "pydantic",
+    "authlib>=1.7.2",
+    "itsdangerous>=2.2.0",
+    "httpx>=0.28.1",
 ]
 
 [project.scripts]
