@@ -28,10 +28,26 @@ def _image_block(path: Path) -> dict:
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
 
-def to_llm_messages(records: list[dict], asset_path: Callable[[str], Path | None]) -> list[dict[str, Any]]:
-    """Rebuild the exact message list the orchestrator keeps in memory."""
+def _window(records: list[dict], max_turns: int | None) -> list[dict]:
+    """Keep only the last `max_turns` conversation turns (a turn starts at a
+    `user` record). Slicing on a user boundary keeps each turn whole, so every
+    assistant tool_call still has its matching tool result — trimming elsewhere
+    would desync the pairing and the provider would reject the request. Bounds
+    the token cost + base64 image re-embedding of resuming a long conversation."""
+    if not max_turns or max_turns <= 0:
+        return records
+    starts = [i for i, r in enumerate(records) if r["role"] == "user"]
+    if len(starts) <= max_turns:
+        return records
+    return records[starts[-max_turns]:]
+
+
+def to_llm_messages(records: list[dict], asset_path: Callable[[str], Path | None],
+                    max_turns: int | None = None) -> list[dict[str, Any]]:
+    """Rebuild the exact message list the orchestrator keeps in memory, optionally
+    windowed to the last `max_turns` turns."""
     out: list[dict[str, Any]] = []
-    for rec in records:
+    for rec in _window(records, max_turns):
         role, content = rec["role"], rec["content"]
         if role == "user":
             ids = content.get("image_asset_ids") or []

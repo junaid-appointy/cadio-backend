@@ -43,6 +43,30 @@ def _perturbed_value(spec: dict, value: Any):
     return int(up) if t == "integer" else up
 
 
+_DIFF_MAX_FACES = 20000  # decimate the perturbed mesh before the proximity diff
+
+
+def _coarsen(mesh, max_faces: int):
+    """Reduce the PERTURBED mesh before the diff. The base mesh stays full so the
+    output indices still address its real facets; only the perturbed side (used
+    for proximity queries) is decimated, which is where the KD-tree build + query
+    cost lives on a detailed model. Best-effort — returns the mesh unchanged if it
+    is already small or simplification is unavailable."""
+    try:
+        import numpy as np
+
+        if len(mesh.faces) <= max_faces:
+            return mesh
+        import fast_simplification
+        import trimesh
+
+        v, f = fast_simplification.simplify(
+            np.asarray(mesh.vertices), np.asarray(mesh.faces), target_count=max_faces)
+        return trimesh.Trimesh(vertices=v, faces=f, process=False)
+    except Exception:
+        return mesh
+
+
 def _affected_faces(base_mesh, pert_mesh, threshold: float) -> list[int]:
     """Symmetric diff mapped onto base faces. Catches both faces that MOVED
     (wall thickness, hole size) and regions where the perturbation ADDED or
@@ -87,10 +111,13 @@ def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
             if newv is None:
                 continue
             try:
-                result = engine.execute(code, {**params, name: newv}, Path(tmp) / name, preview=True)
+                result = engine.execute(
+                    code, {**params, name: newv}, Path(tmp) / name, preview=True, coarse=True)
                 if not result.ok or "stl" not in result.artifacts:
                     continue
-                pert = trimesh.load(result.artifacts["stl"], process=False)
+                # coarse build already yields a light mesh; decimate only if it's
+                # still large (a fallback cold build ignores `coarse`).
+                pert = _coarsen(trimesh.load(result.artifacts["stl"], process=False), _DIFF_MAX_FACES)
                 out[name] = _affected_faces(base, pert, threshold)
             except Exception:
                 continue

@@ -95,8 +95,17 @@ class WorkerPool:
 
     def run(self, request: dict) -> dict:
         """Execute one job on an idle worker. Raises WorkerError on
-        timeout/death (worker is replaced); the caller decides on fallback."""
-        worker = self._idle.get()
+        timeout/death (worker is replaced) or if no worker frees up in time; the
+        caller decides on fallback (the cold path)."""
+        # bounded wait for a free worker: workers are always returned in `finally`
+        # and each job self-times-out, so this only waits out genuinely in-flight
+        # jobs. The ceiling is a safety net against a worker leaking un-returned
+        # (a caller thread dying mid-job) so we fall back to cold instead of
+        # hanging the request forever.
+        try:
+            worker = self._idle.get(timeout=self.timeout_s * 2 + 10)
+        except queue.Empty as exc:
+            raise WorkerError("no idle worker available (pool saturated or stalled)") from exc
         try:
             return worker.run(request, self.timeout_s)
         except WorkerError:

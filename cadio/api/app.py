@@ -33,6 +33,8 @@ WebSocket /ws/chat?project=<pid> — the agent loop for one project:
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
 import json
 import logging
 import os
@@ -44,6 +46,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -62,13 +65,55 @@ ROOT = config.REPO_ROOT
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 
 ASSET_MAX_BYTES = 40 * 1024 * 1024
+# resume windowing: replay at most this many conversation turns into the agent's
+# memory (generous — normal chats are untouched; only pathologically long ones cap).
+HISTORY_MAX_TURNS = int(os.environ.get("CADIO_HISTORY_MAX_TURNS", "40"))
 IMAGE_MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 # reference geometry: agent measures these with inspect_geometry (not shown as images)
 GEOMETRY_EXTS = {".step": "model/step", ".stp": "model/step", ".stl": "model/stl"}
 
-app = FastAPI(title="CADIO", version="0.1.0")
+# live chat sockets (for a clean "going away" on shutdown).
+_active_ws: set[WebSocket] = set()
+SHUTDOWN_DRAIN_S = 15.0  # max we wait for in-flight builds before killing workers
+
+# Per-PROJECT agent sessions. An agent turn (and its build slot) belongs to the
+# project, not the websocket that started it — so a refresh/reconnect re-attaches
+# to the same session and the in-flight build keeps going (see ProjectSession).
+_sessions: dict[str, "ProjectSession"] = {}
+_sessions_lock = threading.Lock()
+
+
+def _inflight_build_count() -> int:
+    return sum(1 for s in _sessions.values() if s.busy)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # startup: nothing to pre-warm (the pool spins up lazily on first build)
+    yield
+    # shutdown (SIGTERM / reload / deploy): finish what we can, then leave cleanly.
+    # 1) let in-flight builds finish so users don't lose an active turn (bounded).
+    deadline = time.monotonic() + SHUTDOWN_DRAIN_S
+    while _inflight_build_count() > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+    # 2) tell each connected client we're going away and close with 1001 (not the
+    #    abrupt 1012), so the browser reconnects gracefully instead of erroring.
+    for ws in list(_active_ws):
+        try:
+            await ws.send_json({"type": "status", "state": "idle"})
+            await ws.close(code=1001)
+        except Exception:
+            pass
+    # 3) kill the warm CAD workers so a reload/restart/deploy never orphans the
+    #    OCCT subprocesses.
+    engine.shutdown()
+
+
+app = FastAPI(title="CADIO", version="0.1.0", lifespan=_lifespan)
 engine = PrecisionEngine()
 store = Store()
+# belt-and-suspenders for hard interpreter exits that skip the lifespan shutdown
+atexit.register(engine.shutdown)
 
 # --- auth: signed session cookie + Google OAuth (see auth.py) ---------------
 # SessionMiddleware covers http + websocket scopes, so ws_chat authenticates by
@@ -83,8 +128,21 @@ app.add_middleware(
     https_only=auth.cookie_secure(),
 )
 app.include_router(auth.router)
+# compress JSON responses — the pick map (face_ids.json is ~1 MB of ints on a
+# detailed model), run/history lists, etc. gzip ~10x on text; binary meshes barely
+# compress but are cache-immutable (below) so each downloads at most once. Range
+# requests aren't used by the viewer (STLLoader/GLB fetch whole files).
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # reject oversized bodies early (added last → outermost → runs before route work)
 app.add_middleware(limits.BodyLimitMiddleware)
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness probe for supervisors / load balancers — unauthenticated, no DB
+    or engine work, so it stays green even under load and never leaks state."""
+    return {"ok": True, "connections": len(_active_ws), "inflight_builds": _inflight_build_count()}
+
 
 # Developer-only diagnostics. These logs are for us (server console), never shown
 # to users — the UI only ever gets generalized messages. uvicorn doesn't touch the
@@ -140,11 +198,15 @@ def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
 # affect maps run the CAD engine once per parameter, so they must never happen on
 # an HTTP request thread (that starved the shared worker pool and hung /affect —
 # the source of the "socket hang up" disconnects). Instead we build them in the
-# background, deduped per run and serialized to one at a time so the interactive
-# agent/preview always keeps a pool worker free.
+# background, deduped per run, and gated by a semaphore so the interactive
+# agent/preview always keeps a pool worker free. The gate allows up to
+# (pool_size - 1) affect builds at once — so a bigger pool lets several users'
+# affect builds proceed concurrently instead of queueing behind one global lock.
 _affect_jobs: set[str] = set()          # run_dirs with a build queued or running
 _affect_reg_lock = threading.Lock()     # guards _affect_jobs
-_affect_build_lock = threading.Lock()   # at most one affect build runs at a time
+_AFFECT_CONCURRENCY = int(os.environ.get(
+    "CADIO_AFFECT_CONCURRENCY", str(max(1, engine._pool_size - 1))))
+_affect_gate = threading.BoundedSemaphore(_AFFECT_CONCURRENCY)
 
 
 def _ensure_precompute(run_dir: Path, params: dict, manifest: list) -> None:
@@ -157,7 +219,7 @@ def _ensure_precompute(run_dir: Path, params: dict, manifest: list) -> None:
 
     def job() -> None:
         try:
-            with _affect_build_lock:  # serialize: leave a worker for the live agent
+            with _affect_gate:  # cap concurrency so a live agent keeps a worker
                 code = (run_dir / "program.py").read_text()
                 affect.build_and_cache(engine, code, params, manifest, run_dir)
         except Exception:
@@ -287,6 +349,7 @@ def run_facemap(pid: str, run_id: str, user: dict = Depends(get_current_user)):
         "face_ids": _read("face_ids.json", []),
         "faces": _read("faces.json", []),
         "edges": _read("edges.json", []),
+        "parts": _read("parts.json", []),
     }
 
 
@@ -435,6 +498,174 @@ def healthz():
     return {"ok": True}
 
 
+# ---- per-project agent session --------------------------------------------
+
+
+class ProjectSession:
+    """Owns one project's agent: its Orchestrator, in-flight turn, and build slot.
+
+    The turn runs in a background thread owned by the SESSION, not by any socket,
+    so a websocket refresh/reconnect just re-`attach()`es to the same session:
+    the build keeps running, its live events go to whichever socket is currently
+    attached, and the build slot is released when the TURN finishes. A message
+    sent while a turn is running is correctly refused ('already running'), and the
+    reconnecting client is shown the in-progress status instead of an empty chat.
+    """
+
+    def __init__(self, pid: str, uid: str):
+        self.pid = pid
+        self.uid = uid
+        self.lock = threading.Lock()
+        self.busy = False
+        self.sink: Callable[[dict], None] | None = None  # current attached client
+        self.answers_q: queue.Queue = queue.Queue()
+        self.ask_pending = False
+        self.pending_ask: list[dict] | None = None       # re-sent on reattach
+        self.orch = Orchestrator(
+            engine, config.project_runs_dir(pid),
+            ask_user=self._ask_user, on_event=self._on_event, on_message=self._on_message,
+            inspect_asset=self._inspect_asset, trace_asset=self._trace_asset,
+        )
+        records = store.get_messages(pid)
+        if records:
+            self.orch.set_history(
+                history.to_llm_messages(records, self._asset_path, max_turns=HISTORY_MAX_TURNS))
+
+    # --- client attach/detach (called from the event loop) ---
+    def attach(self, sink: Callable[[dict], None]) -> tuple[bool, list[dict] | None]:
+        """Make `sink` the live destination. Returns (busy, pending_ask) so the
+        caller can await-send the in-progress status/question on the new socket."""
+        with self.lock:
+            self.sink = sink
+            return self.busy, self.pending_ask
+
+    def detach(self, sink: Callable[[dict], None]) -> None:
+        with self.lock:
+            if self.sink is sink:
+                self.sink = None
+
+    def deliver(self, payload: dict) -> None:
+        """Best-effort live push to the attached socket (called from the turn
+        thread). No client attached → dropped; the DB copy makes it recoverable."""
+        sink = self.sink
+        if sink is not None:
+            sink(payload)
+
+    # --- orchestrator callbacks (project-scoped; persist always, push if attached) ---
+    def _on_message(self, role: str, record: dict) -> None:
+        store.add_message(self.pid, role, record)
+
+    def _on_event(self, event: dict) -> None:
+        if event.get("type") == "run":
+            run_id = event["run_id"]
+            payload = _save_run(self.pid, run_id, event["result"], event.get("label", ""))
+            store.add_message(self.pid, "event", {"kind": "run", "run_id": run_id})
+            self.deliver({"type": "run", "meta": payload})
+        else:
+            self.deliver(event)
+
+    def _ask_user(self, questions: list[dict]) -> list[dict]:
+        self.pending_ask = questions
+        self.ask_pending = True
+        self.deliver({"type": "ask_user", "questions": questions})
+        try:
+            answers = self.answers_q.get()
+        finally:
+            self.ask_pending = False
+            self.pending_ask = None
+        return answers if answers is not None else []
+
+    def _asset_path(self, aid: str) -> Path | None:
+        a = store.get_asset(self.pid, aid)
+        if not a:
+            return None
+        p = config.project_refs_dir(self.pid) / a["file"]
+        return p if p.exists() else None
+
+    def _inspect_asset(self, aid: str) -> dict:
+        from ..engines.precision.inspect import inspect_geometry
+        p = self._asset_path(aid)
+        if not p:
+            return {"error": f"no such reference geometry: {aid!r}"}
+        return inspect_geometry(p)
+
+    def _trace_asset(self, aid: str, opts: dict):
+        from .. import trace
+        a = store.get_asset(self.pid, aid)
+        p = self._asset_path(aid)
+        if not a or not p:
+            return {"error": f"no such image: {aid!r}"}
+        if not a["mime"].startswith("image/"):
+            return {"error": "build_from_image needs an image (PNG/JPG/WEBP)"}
+        try:
+            tr = trace.trace_polygons(p)
+        except ValueError as exc:
+            return {"error": f"could not trace the image: {exc}"}
+        return trace.generate_program(
+            tr, opts.get("width_mm", 40.0), opts.get("logo_height_mm", 2.0),
+            opts.get("base_thickness_mm", 1.5))
+
+    # --- turn lifecycle ---
+    def submit_answers(self, answers: list) -> None:
+        if self.ask_pending:
+            self.answers_q.put(answers)
+
+    def request_stop(self) -> None:
+        self.orch.request_stop()
+        if self.ask_pending:
+            self.answers_q.put(None)
+
+    def start_turn(self, text: str, images: list[dict]) -> str | None:
+        """Kick off a turn in a session-owned thread. Returns an error string if
+        the turn can't start (busy / quota / slot), else None."""
+        with self.lock:
+            if self.busy:
+                return "You already have a build running — wait for it to finish."
+            if not limits.check_daily_quota(store, self.uid):
+                return "Daily build quota reached — try again tomorrow."
+            if not limits.acquire_build_slot(self.uid):
+                return "You already have a build running — wait for it to finish."
+            self.busy = True
+        threading.Thread(target=self._run_turn, args=(text, images), daemon=True).start()
+        return None
+
+    def _run_turn(self, text: str, images: list[dict]) -> None:
+        self.deliver({"type": "status", "state": "thinking"})
+        try:
+            reply = self.orch.send(text, images)
+            self.deliver({"type": "assistant", "text": reply})
+        except Exception:
+            if self.orch.messages and self.orch.messages[-1].get("role") == "user":
+                self.orch.messages.pop()
+            ref = uuid.uuid4().hex[:6]
+            log.error("session %s turn failed ref=%s", self.pid, ref, exc_info=True)
+            self.deliver({"type": "error",
+                          "message": f"Something went wrong handling that request. Please try again. (ref {ref})"})
+        finally:
+            limits.release_build_slot(self.uid)
+            with self.lock:
+                self.busy = False
+            self.deliver({"type": "status", "state": "idle"})
+            _maybe_evict_session(self)
+
+
+def _get_session(pid: str, uid: str) -> ProjectSession:
+    with _sessions_lock:
+        s = _sessions.get(pid)
+        if s is None:
+            s = ProjectSession(pid, uid)
+            _sessions[pid] = s
+        return s
+
+
+def _maybe_evict_session(session: ProjectSession) -> None:
+    """Drop an idle session (no turn running, no client) so its orchestrator memory
+    is freed; it rebuilds from the DB on the next connect."""
+    with _sessions_lock:
+        if not session.busy and session.sink is None and _sessions.get(session.pid) is session:
+            del _sessions[session.pid]
+
+
 # ---- websocket chat -------------------------------------------------------
 
 @app.websocket("/ws/chat")
@@ -457,130 +688,33 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
         await ws.close()
         return
     log.info("ws %s open project=%s", cid, pid)
+    _active_ws.add(ws)
 
     loop = asyncio.get_running_loop()
-    answers_q: queue.Queue = queue.Queue()
-    chat_q: asyncio.Queue = asyncio.Queue()
     chat_bucket = limits.new_bucket(10, 60)  # per-connection: 10 chat messages/min
-    closed = False
-    ask_pending = False
+    closed = {"v": False}
 
-    def send_threadsafe(payload: dict) -> None:
-        if closed:
+    def sink(payload: dict) -> None:
+        """Thread-safe push to THIS socket. Called from the turn thread; blocks it
+        briefly so a slow/dead client can't stall the build, then gives up."""
+        if closed["v"]:
             return
         try:
-            asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop).result(timeout=30)
+            asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop).result(timeout=8)
             log.debug("ws %s -> %s", cid, payload.get("type"))
         except Exception:
-            # the socket may have dropped mid-turn; record it, don't crash the worker
             log.warning("ws %s send failed type=%s", cid, payload.get("type"), exc_info=True)
 
-    def ask_user(questions: list[dict]) -> list[dict]:
-        nonlocal ask_pending
-        send_threadsafe({"type": "ask_user", "questions": questions})
-        ask_pending = True
-        try:
-            answers = answers_q.get()
-        finally:
-            ask_pending = False
-        return answers if answers is not None else []
+    session = _get_session(pid, uid)
+    busy, pending_ask = session.attach(sink)
+    if busy:
+        # a turn from a previous connection is still running — show it so the chat
+        # isn't empty, and re-send any outstanding question. The reply arrives here
+        # when the turn completes.
+        await ws.send_json({"type": "status", "state": "thinking"})
+        if pending_ask:
+            await ws.send_json({"type": "ask_user", "questions": pending_ask})
 
-    def on_event(event: dict) -> None:
-        if event.get("type") == "run":
-            run_id = event["run_id"]
-            payload = _save_run(pid, run_id, event["result"], event.get("label", ""))
-            store.add_message(pid, "event", {"kind": "run", "run_id": run_id})
-            send_threadsafe({"type": "run", "meta": payload})
-        else:
-            send_threadsafe(event)
-
-    def on_message(role: str, record: dict) -> None:
-        store.add_message(pid, role, record)
-
-    def asset_path(aid: str) -> Path | None:
-        a = store.get_asset(pid, aid)
-        if not a:
-            return None
-        p = config.project_refs_dir(pid) / a["file"]
-        return p if p.exists() else None
-
-    def inspect_asset(aid: str) -> dict:
-        from ..engines.precision.inspect import inspect_geometry
-        p = asset_path(aid)
-        if not p:
-            return {"error": f"no such reference geometry: {aid!r}"}
-        return inspect_geometry(p)
-
-    def trace_asset(aid: str, opts: dict):
-        """Image -> build123d program (traced outline). str on success, {'error'} on failure."""
-        from .. import trace
-        a = store.get_asset(pid, aid)
-        p = asset_path(aid)
-        if not a or not p:
-            return {"error": f"no such image: {aid!r}"}
-        if not a["mime"].startswith("image/"):
-            return {"error": "build_from_image needs an image (PNG/JPG/WEBP)"}
-        try:
-            tr = trace.trace_polygons(p)
-        except ValueError as exc:
-            return {"error": f"could not trace the image: {exc}"}
-        return trace.generate_program(
-            tr, opts.get("width_mm", 40.0), opts.get("logo_height_mm", 2.0),
-            opts.get("base_thickness_mm", 1.5))
-
-    orch = Orchestrator(
-        engine, config.project_runs_dir(pid),
-        ask_user=ask_user, on_event=on_event, on_message=on_message,
-        inspect_asset=inspect_asset, trace_asset=trace_asset,
-    )
-    # rebuild the agent's memory from stored history (resume)
-    records = store.get_messages(pid)
-    if records:
-        orch.set_history(history.to_llm_messages(records, asset_path))
-
-    async def send_or_stop(payload: dict) -> bool:
-        try:
-            await ws.send_json(payload)
-            return True
-        except Exception:
-            return False
-
-    async def worker():
-        while True:
-            text, images = await chat_q.get()
-            # abuse gates: one live agent turn per user, and a daily run quota
-            if not limits.check_daily_quota(store, uid):
-                await send_or_stop({"type": "error",
-                                    "message": "Daily build quota reached — try again tomorrow."})
-                await send_or_stop({"type": "status", "state": "idle"})
-                continue
-            if not limits.acquire_build_slot(uid):
-                await send_or_stop({"type": "error",
-                                    "message": "You already have a build running — wait for it to finish."})
-                await send_or_stop({"type": "status", "state": "idle"})
-                continue
-            await ws.send_json({"type": "status", "state": "thinking"})
-            try:
-                reply = await asyncio.to_thread(orch.send, text, images)
-                await ws.send_json({"type": "assistant", "text": reply})
-            except Exception:
-                if orch.messages and orch.messages[-1].get("role") == "user":
-                    orch.messages.pop()
-                # Full detail to the server log (for us); the user gets a generic
-                # message tagged with the same ref so a report maps back to this line.
-                ref = uuid.uuid4().hex[:6]
-                log.error("ws %s agent turn failed ref=%s", cid, ref, exc_info=True)
-                if not await send_or_stop({
-                    "type": "error",
-                    "message": f"Something went wrong handling that request. Please try again. (ref {ref})",
-                }):
-                    return
-            finally:
-                limits.release_build_slot(uid)
-            if not await send_or_stop({"type": "status", "state": "idle"}):
-                return
-
-    worker_task = asyncio.create_task(worker())
     try:
         while True:
             data = await ws.receive_json()
@@ -588,9 +722,9 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
             log.debug("ws %s <- %s", cid, kind)  # type only; never the api_key or message body
             if kind == "init":
                 if data.get("model"):
-                    orch.model = data["model"]
-                orch.api_key = data.get("api_key") or None
-                await ws.send_json({"type": "ready", "model": orch.model})
+                    session.orch.model = data["model"]
+                session.orch.api_key = data.get("api_key") or None
+                await ws.send_json({"type": "ready", "model": session.orch.model})
             elif kind == "chat" and data.get("text", "").strip():
                 if not chat_bucket.take():
                     await ws.send_json({"type": "error",
@@ -616,22 +750,25 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
                             config.project_runs_dir(pid) / str(sel["run_id"]), faces, edges)
                         if note:
                             text += "\n\n" + note
-                chat_q.put_nowait((text, images))
+                err = session.start_turn(text, images)
+                if err:
+                    await ws.send_json({"type": "error", "message": err})
+                    await ws.send_json({"type": "status", "state": "idle"})
             elif kind == "answers":
-                answers_q.put(data.get("answers", []))
+                session.submit_answers(data.get("answers", []))
             elif kind == "stop":
-                orch.request_stop()
-                if ask_pending:
-                    answers_q.put(None)
+                session.request_stop()
     except WebSocketDisconnect as exc:
-        # normal client-side close (tab closed, navigated away, network blip)
+        # normal client-side close (tab closed, refresh, navigated away, blip). The
+        # turn keeps running in the session; a reconnect re-attaches to it.
         log.info("ws %s closed by client code=%s", cid, getattr(exc, "code", "?"))
     except Exception:
         log.error("ws %s receive loop crashed", cid, exc_info=True)
     finally:
-        closed = True
-        answers_q.put(None)
-        worker_task.cancel()
+        closed["v"] = True
+        _active_ws.discard(ws)
+        session.detach(sink)
+        _maybe_evict_session(session)
         log.info("ws %s teardown project=%s", cid, pid)
 
 
@@ -668,13 +805,20 @@ def _safe_file(base: Path, rel: str) -> Path | None:
     return target
 
 
+# run artifacts + reference uploads are content-addressed (a run_id / asset_id dir
+# never changes once written), so they're safe to cache hard. This stops the viewer
+# re-downloading the (up to 13 MB) STL every time you switch between saved versions.
+# FileResponse also sets ETag/Last-Modified, so even a hard reload gets a 304.
+_IMMUTABLE = "public, max-age=31536000, immutable"
+
+
 @app.get("/files/{pid}/{path:path}")
 def project_file(pid: str, path: str, user: dict = Depends(get_current_user)):
     require_project(pid, user)
     target = _safe_file(config.project_dir(pid), path)
     if target is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return FileResponse(target)
+    return FileResponse(target, headers={"Cache-Control": _IMMUTABLE})
 
 
 @app.get("/previews/{path:path}")

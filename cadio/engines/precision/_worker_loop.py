@@ -27,6 +27,7 @@ for line in sys.stdin:
             outdir=req["outdir"],
             params=req.get("params"),
             preview=bool(req.get("preview")),
+            coarse=bool(req.get("coarse")),
         )
     except Exception as exc:  # malformed request — report, keep serving
         result = {"ok": False, "error": f"worker request error: {exc}"}

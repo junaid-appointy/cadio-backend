@@ -88,6 +88,22 @@ COMPLETENESS DISCIPLINE (this is how you avoid missing parts — the #1 failure)
   drop features to make it fit.
 - Every requirement number becomes a named parameter in PARAMS, and hard
   requirements become assert statements inside build().
+- Define a `features(part, params)` map naming every part a user is likely to
+  click on in the viewer (grip, barrel, trigger_guard, spout, base, each boss...).
+  Named parts give the user clean, stable selection and give you an unambiguous
+  handle when they say "make THIS taller" — so name generously, not just one or two.
+  NAME BY CONSTRUCTION SUB-SOLID, NOT BY POSITION. Build each part as its own
+  named solid, union them in build(), and return those same solids from
+  features(); the runner assigns each final face to the solid it lies on. A teddy
+  bear is head + muzzle + two ears + torso + two arms + two legs + bow — about
+  eight named solids, NOT three height bands ("everything from z=20 to z=50 is the
+  torso"). A positional band is not a part: it swallows whatever else sits at that
+  height (a band like that once mislabeled the bow as the torso and the agent
+  smoothed the whole torso instead of the bow). Symmetric parts may share one name
+  ("ear", "leg") — the viewer auto-qualifies them left/right/front/back by
+  position — or be named individually ("left_ear"). If the build report warns that
+  one name covers a large share of faces, you under-named: split it into real
+  per-part sub-solids and rebuild.
 - After each run, read the validation report and self-repair errors before
   showing the user anything.
 """
@@ -238,8 +254,16 @@ PARAMETER DESIGN (the PARAMS list — this is how the user tweaks the model):
   duplicate names fail the build, and per-instance knobs make the model
   untweakable. This is the MULTI-FEATURE RECIPE pattern above (count + loop).
 - Give every numeric parameter a real-world `min`/`max` (so the UI shows a
-  slider, not a bare box) and a per-feature `group` ("Body", "Wheels",
-  "Mounting") so related knobs cluster instead of forming one flat list.
+  slider, not a bare box) and a per-feature `group` so related knobs cluster
+  instead of forming one flat list.
+- PER-PART GRANULARITY: every named feature (from features()) gets AT LEAST ONE
+  dimensional parameter of its own, and that parameter's `group` is the feature's
+  name ("Head", "Bow", "Ears") so the sidebar reads as one section per part. If
+  the user can click a part in the viewer, they must be able to tweak it: a bow
+  needs `bow_width`/`bow_thickness`, ears need `ear_diameter`, etc. A whole-model
+  knob (overall height, a proportion multiplier) is fine IN ADDITION to per-part
+  dimensions, never as a substitute for them. Rule of thumb: if it has a name in
+  features(), it has a parameter in PARAMS.
 - Parameter names must be unique and be valid identifiers; the build fails
   loudly on a duplicate — read the error and merge the duplicates into a
   count + shared-dimension pattern.

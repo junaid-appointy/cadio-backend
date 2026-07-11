@@ -33,6 +33,21 @@ except Exception:
     pass
 
 DATA_DIR = Path(os.environ.get("CADIO_HOME", Path.home() / ".cadio"))
+
+# One-time move for installs from before the Forma -> CADIO rename: the whole
+# runtime dir moved from ~/.forma to ~/.cadio, so upgrading in place would
+# otherwise silently start every user from an empty database.
+_legacy_home = Path.home() / ".forma"
+if _legacy_home.is_dir() and not DATA_DIR.exists():
+    try:
+        DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(_legacy_home), str(DATA_DIR))
+        _legacy_db = DATA_DIR / "forma.db"
+        if _legacy_db.exists():
+            _legacy_db.rename(DATA_DIR / "cadio.db")
+    except OSError:
+        pass  # cross-device or permission issue — start fresh instead
+
 DB_PATH = DATA_DIR / "cadio.db"
 PROJECTS_DIR = DATA_DIR / "projects"
 PREVIEW_DIR = DATA_DIR / "previews"

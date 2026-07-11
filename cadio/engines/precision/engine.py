@@ -61,18 +61,28 @@ A precision-engine program is a Python file using build123d (algebra mode) that 
    (e.g. `assert cavity_depth >= 32.4, "clearance under plate"`) so violated
    requirements fail loudly instead of producing wrong geometry.
 
-3. `features(part, params) -> dict[str, faces]` — OPTIONAL. Name the parts a
-   user is likely to point at, so a click in the viewer resolves to a stable name
-   ("make `left_boss` taller") that survives rebuilds. Map each name to the
-   face(s) it covers, selected from the built part, e.g.:
-     from build123d import GeomType
+3. `features(part, params) -> dict[str, shape]` — STRONGLY RECOMMENDED for any
+   model with more than one visually distinct part. Names the parts a user points
+   at, so a click in the viewer resolves to a stable name ("make `bow` bigger")
+   that survives rebuilds and scopes the edit to THAT part.
+   PREFERRED FORM — name each CONSTRUCTION SUB-SOLID. Build every part as its own
+   named solid, union them in build(), and return those same solids here. The
+   runner assigns each final face to the solid whose surface it lies on:
+     def build(params):
+         head  = Pos(0, 0, 70) * Sphere(30)
+         torso = Pos(0, 0, 35) * Sphere(38)
+         bow   = Pos(0, -34, 52) * Box(16, 6, 10)
+         return head + torso + bow           # + ears, arms, legs...
      def features(part, params):
-         return {
-             "spout": part.faces().filter_by(GeomType.CYLINDER),
-             "base":  part.faces().sort_by(Axis.Z)[0],
-         }
-   Values may be a Face, a ShapeList, or a list of Faces. Prefer stable, semantic
-   names for the salient features; leave incidental faces unnamed.
+         # rebuild (or factor out) the same named solids and return them
+         return {"head": head, "torso": torso, "bow": bow, ...}
+   Values may also be a Face, a ShapeList, or a list of Faces (classic form).
+   NAME BY WHAT THE PART IS, NEVER BY POSITION. Do NOT map a name to "every face
+   between z=20 and z=50" — a positional band swallows whatever else sits there
+   (this mislabeled a teddy bear's bow as its torso and smoothed the wrong part).
+   Symmetric/repeated parts may share ONE name (the viewer auto-qualifies them
+   "left"/"right"/"front"/… by position) or be named individually. Name every
+   salient part generously; leave only incidental faces unnamed.
 
 The runner (not your code) handles export, measurement, and validation.
 Do not import anything except build123d, math, and dataclasses.
@@ -101,6 +111,7 @@ class PrecisionEngine:
         params: dict[str, Any] | None,
         run_dir: Path,
         preview: bool = False,
+        coarse: bool = False,
     ) -> ExecutionResult:
         # absolute: subprocesses run with cwd inside the sandbox, so relative
         # paths would resolve inside themselves
@@ -115,6 +126,10 @@ class PrecisionEngine:
             "outdir": str(run_dir),
             "params": params or {},
             "preview": preview,
+            # coarse STL tessellation — only for throwaway diff builds (affect
+            # maps), where a fine mesh is wasted: far fewer triangles to export
+            # and to run proximity queries against.
+            "coarse": coarse,
         }
 
         raw: dict | None = None
@@ -141,6 +156,15 @@ class PrecisionEngine:
             if self._pool is None:
                 self._pool = WorkerPool(size=self._pool_size, timeout_s=self.timeout_s)
             return self._pool
+
+    def shutdown(self) -> None:
+        """Kill the warm worker subprocesses (idempotent). Wire this to app
+        shutdown / process exit so reloads, restarts, and crashes don't orphan
+        the OCCT workers — otherwise every reload leaks two python subprocesses."""
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.shutdown()
+                self._pool = None
 
     def _run_cold(
         self, program_path: Path, params: dict[str, Any] | None, run_dir: Path
@@ -181,6 +205,18 @@ class PrecisionEngine:
         )
         if glb:
             artifacts["glb"] = str(glb)
+
+        # naming-quality warnings from the sandbox part table (lazy/under-naming).
+        # They're warnings, not errors — they don't flip validation.ok, but they
+        # ride into the agent's tool result so it names parts individually next.
+        from ..base import ValidationIssue
+
+        for entry in raw.get("warnings", []) or []:
+            try:
+                code, msg = entry
+            except (ValueError, TypeError):
+                continue
+            validation.issues.append(ValidationIssue("warning", str(code), str(msg)))
 
         # renders are the agent's eyes + the project thumbnail — non-preview only
         renders: dict[str, str] = {}

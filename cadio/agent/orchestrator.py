@@ -33,6 +33,16 @@ from ..engines.base import Engine
 
 DEFAULT_MODEL = os.environ.get("CADIO_MODEL", "anthropic/claude-opus-4-8")
 
+# Output-token budget per LLM call. The old 16k cap truncated the model mid-turn
+# on detailed parts (long program + high-effort reasoning), so it never reached
+# the run_cad tool call and the half-written program leaked into the chat as the
+# "answer". 32k comfortably fits a full program plus reasoning on every common
+# provider (Claude/GPT/Gemini all accept it). Override with CADIO_MAX_OUTPUT_TOKENS.
+MAX_OUTPUT_TOKENS = int(os.environ.get("CADIO_MAX_OUTPUT_TOKENS", "32000"))
+# How many times to re-prompt after a truncated, tool-less response before giving
+# up with a real message (never raw code) — guards against an infinite retry loop.
+MAX_TRUNCATION_RETRIES = 2
+
 TOOLS = [
     {
         "type": "function",
@@ -42,7 +52,10 @@ TOOLS = [
                 "Execute a precision-engine program (build123d Python, per the program "
                 "contract) in the sandbox. Returns measured bbox/volume and the "
                 "validation report. Use this to build and to self-check; fix any "
-                "validation errors before answering the user."
+                "validation errors before answering the user. ALWAYS put the complete "
+                "program in the `code` argument — NEVER paste the program (PARAMS/build) "
+                "into your text reply. Building a model means calling this tool, not "
+                "printing code; your text is only a short explanation."
             ),
             "parameters": {
                 "type": "object",
@@ -209,19 +222,35 @@ class Orchestrator:
                 pass  # UI notification must never break the loop
 
     def _system_prompt(self) -> str:
-        return (
+        # static (corpus + contract + rules don't change within a session), so
+        # build the string once instead of concatenating the whole corpus on
+        # every LLM call in the tool loop.
+        cached = getattr(self, "_system_prompt_cache", None)
+        if cached is not None:
+            return cached
+        prompt = (
             "You are CADIO, an AI agent that turns user intent into accurate, "
             "parametric, exportable 3D models. You never click a GUI — you write "
             "programs that the engine executes, then you inspect the measured "
             "results and iterate until the validation report is clean and the "
             "geometry matches the requirements.\n\n"
+            "HOW YOU BUILD: to make a model you CALL the run_cad tool with the "
+            "complete program in its `code` argument. NEVER write the program "
+            "(PARAMS, build(), features()) into your text reply — the user wants a "
+            "built model, not source code. Do your planning briefly, then call the "
+            "tool. Your text messages are only short explanations, never the program.\n\n"
             "When a message says the user SELECTED a specific part/feature of the "
             "current model, scope your edit to THAT feature and preserve everything "
             "else. Define a features() map naming the parts users are likely to "
-            "point at, and keep those names stable across rebuilds.\n\n"
+            "point at (one named construction sub-solid per part, never positional "
+            "bands), and keep those names stable across rebuilds. If a selection "
+            "note says the selected part has NO controlling parameter, add one for "
+            "it in the same edit so the user can tweak it afterward.\n\n"
             "ENGINE PROGRAM CONTRACT:\n" + self.engine.program_contract() + "\n\n"
             + system_corpus()
         )
+        self._system_prompt_cache = prompt
+        return prompt
 
     def _run_program(self, code: str, params: dict | None, label: str) -> str:
         """Execute a build123d program, emit the run event, queue renders for
@@ -292,6 +321,7 @@ class Orchestrator:
         tin = tout = calls = 0
         cost = 0.0
         cost_ok = True
+        truncations = 0  # consecutive length-capped replies with no tool call
 
         def turn_usage() -> dict[str, Any]:
             return {
@@ -312,11 +342,12 @@ class Orchestrator:
             extra = {"api_key": self.api_key} if self.api_key else {}
             # push the model to reason harder about detailed multi-feature parts.
             # reasoning_effort is best-effort — drop_params silently removes it
-            # for models that don't support it. (max_tokens kept at a value all
-            # common models accept; the CAD program itself is small.)
+            # for models that don't support it. max_tokens is generous so a full
+            # program + reasoning fits in one call (a tight cap used to truncate the
+            # turn before the run_cad tool call — see the truncation guard below).
             response = litellm.completion(
                 model=self.model,
-                max_tokens=16000,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 reasoning_effort="high",
                 drop_params=True,
                 messages=[{"role": "system", "content": self._system_prompt()}]
@@ -334,8 +365,36 @@ class Orchestrator:
             except Exception:
                 cost_ok = False  # unknown/self-hosted model — hide the $ figure
 
-            msg = response.choices[0].message
+            choice = response.choices[0]
+            msg = choice.message
             tool_calls = msg.tool_calls or []
+
+            # Truncation guard: the model hit the output cap and stopped WITHOUT
+            # calling a tool — almost always because it was writing the program
+            # into its reply and ran out of room. Never surface that half-written
+            # code as the answer. Nudge it to call run_cad and retry (bounded), and
+            # if it still won't, return a real message instead of the code dump.
+            if getattr(choice, "finish_reason", None) in ("length", "max_tokens") and not tool_calls:
+                truncations += 1
+                if truncations > MAX_TRUNCATION_RETRIES:
+                    self.last_usage = turn_usage()
+                    reply = ("I couldn't fit that build into a single step — the program kept "
+                             "getting cut off before it ran. Try again, or ask for it in a few "
+                             "smaller steps (fewer features at a time).")
+                    self._persist("assistant", {"content": reply, "tool_calls": None,
+                                                 "usage": self.last_usage})
+                    self._emit({"type": "usage", "usage": self.last_usage})
+                    return reply
+                # keep the partial in the model's working memory (NOT persisted, so
+                # it never appears in the user's scrollback), then correct course.
+                self.messages.append({"role": "assistant", "content": msg.content or ""})
+                self.messages.append({"role": "user", "content": (
+                    "Your previous message was cut off before you built anything, and you did "
+                    "not call any tool. Do NOT paste the program into your reply. Call the "
+                    "run_cad tool now with the COMPLETE program in its `code` argument; keep any "
+                    "text to one short sentence.")})
+                continue
+            truncations = 0  # a complete (or tool-calling) response — reset the guard
 
             assistant: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
             if tool_calls:

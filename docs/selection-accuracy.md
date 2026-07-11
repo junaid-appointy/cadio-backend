@@ -1,6 +1,10 @@
 # Face/Edge Selection Accuracy — Diagnosis & Fix Plan
 
-Status: diagnosed 2026-07-08, verified against real run data. Not yet implemented.
+Status: diagnosed 2026-07-08, IMPLEMENTED 2026-07-09 (regions + region-aware
+select.py + region/precise frontend selection + screen-space edge picking +
+denser edges + corpus nudge). The A-plan's naive tangent-union over-merged
+(one 74% blob) — shipped version merges same-surface large faces + attaches
+sliver clusters to their single largest neighbour instead.
 
 ## Symptom (user report)
 Clicking a part of the model selects **more** area than intended, or **less**

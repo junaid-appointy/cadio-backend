@@ -21,18 +21,21 @@ CLI_RUNS = config.DATA_DIR / "cli-runs"
 
 
 def cmd_serve(args) -> int:
-    """Start the web app. Auto-reload is on and safe (all runtime data lives in
-    ~/.cadio, outside the repo, so builds never trigger the reloader). Watches
-    only the cadio/ package."""
+    """Start the web app. Auto-reload is OFF by default so connections stay
+    stable — each reload drops every live WebSocket (code 1012), recycles the
+    CAD worker pool, and kills in-flight background jobs. Pass --reload for local
+    development (runtime data lives in ~/.cadio, outside the repo, so builds
+    never trigger the reloader; it watches only the cadio/ package)."""
     import uvicorn
 
-    print(f"\n  cadio → http://{args.host}:{args.port}\n")
+    print(f"\n  cadio → http://{args.host}:{args.port}"
+          f"{'  (auto-reload ON — dev)' if args.reload else ''}\n")
     uvicorn.run(
         "cadio.api.app:app",
         host=args.host,
         port=args.port,
-        reload=not args.no_reload,
-        reload_dirs=[str(Path(__file__).parent)],
+        reload=args.reload,
+        reload_dirs=[str(Path(__file__).parent)] if args.reload else None,
     )
     return 0
 
@@ -96,7 +99,9 @@ def main() -> int:
     p_serve = sub.add_parser("serve", help="run the web app (default)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
-    p_serve.add_argument("--no-reload", action="store_true", help="disable auto-reload")
+    p_serve.add_argument("--reload", action="store_true",
+                         help="auto-reload on source edits (dev only — each reload drops "
+                              "live WebSockets and recycles the CAD worker pool)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_run = sub.add_parser("run", help="execute a program and validate it")

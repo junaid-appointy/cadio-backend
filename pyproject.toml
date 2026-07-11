@@ -19,6 +19,8 @@ dependencies = [
     "authlib>=1.7.2",
     "itsdangerous>=2.2.0",
     "httpx>=0.28.1",
+    "fast-simplification>=0.1.13",
+    "networkx>=3.4.2",
 ]
 
 [project.scripts]
