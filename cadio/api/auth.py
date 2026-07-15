@@ -25,6 +25,8 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from .. import config
+
 log = logging.getLogger("cadio.api")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -61,7 +63,15 @@ def cookie_secure() -> bool:
     env = os.environ.get("CADIO_COOKIE_SECURE")
     if env is not None:
         return env.lower() in ("1", "true", "yes")
+    if config.cross_site():
+        return True  # SameSite=None requires Secure
     return auth_enabled()  # default: secure in prod (creds set), lax for local dev
+
+
+def cookie_same_site() -> str:
+    """Cross-origin frontend => the session cookie must be SameSite=None to ride
+    on its fetch/websocket calls; single-origin stays Lax (CSRF-safer)."""
+    return "none" if config.cross_site() else "lax"
 
 
 def _allowed(email: str) -> bool:
@@ -99,23 +109,37 @@ async def login(request: Request):
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
+# after OAuth, send the browser back to the FRONTEND origin (its own host when
+# split; same-origin "/" otherwise). Errors carry ?login_error=… for the UI.
+def _home(login_error: str | None = None) -> str:
+    base = config.frontend_home()
+    if login_error:
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}login_error={login_error}"
+    return base
+
+
 @router.get("/callback", name="auth_callback")
 async def callback(request: Request):
     if not auth_enabled():
-        return RedirectResponse("/")
+        return RedirectResponse(_home())
     try:
         token = await oauth.google.authorize_access_token(request)
-    except OAuthError:
-        return RedirectResponse("/?login_error=failed")
+    except OAuthError as e:
+        # Common cause: the session (state) cookie set during /login wasn't sent
+        # back here — a redirect-URI landing on a different origin, or a Secure
+        # cookie dropped over http. Log the real reason; the UI only sees "failed".
+        log.warning("OAuth callback failed: %s", e.error or e)
+        return RedirectResponse(_home("failed"))
     info = token.get("userinfo") or {}
     email = info.get("email")
     if not email or not info.get("email_verified"):
-        return RedirectResponse("/?login_error=unverified")
+        return RedirectResponse(_home("unverified"))
     if not _allowed(email):
-        return RedirectResponse("/?login_error=not_invited")
+        return RedirectResponse(_home("not_invited"))
     user = _store.upsert_user(info["sub"], email, info.get("name"), info.get("picture"))
     request.session["uid"] = user["id"]
-    return RedirectResponse("/")
+    return RedirectResponse(_home())
 
 
 @router.post("/logout")

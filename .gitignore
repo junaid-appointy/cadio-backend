@@ -10,3 +10,8 @@ dist/
 assets/
 
 .env
+
+# agent / editor local config
+.claude/
+.codex/
+.agents/

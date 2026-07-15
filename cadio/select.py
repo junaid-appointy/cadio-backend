@@ -166,10 +166,14 @@ def _governing_params(run_dir: Path, region: set[int]) -> list[str]:
 
 
 def describe_selection(
-    run_dir: Path, face: int, max_angle_deg: float = 20.0
+    run_dir: Path, face: int, max_angle_deg: float = 20.0,
+    anchor: int | None = None, precise: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve a clicked facet into a stable part description:
     {faces, display, feature, where, governed_by, centroid_mm, size_mm, normal}.
+    `anchor` is the BREP face id the viewer resolved the click to (falls back to
+    face_ids[face]); `precise=True` (Alt-click) scopes the description to that
+    single BREP face instead of the whole part, matching the viewer highlight.
     Returns None if the run has no mesh or the index is out of range."""
     import numpy as np
     import trimesh
@@ -190,21 +194,43 @@ def describe_selection(
     parts = _load_parts(run_dir)
     display: str | None = None
     part_meta: dict | None = None
+    on_part: str | None = None
+    clicked: dict | None = None
 
-    # Preferred: the sandbox PART TABLE — the clicked facet resolves to the whole
-    # part it belongs to (the bow, not "the torso"), with a unique display name.
-    if face_ids is not None and parts:
-        target = face_ids[face]
-        part_meta = _part_for_face(parts, target)
-    if part_meta is not None:
+    # the clicked BREP face: trust the viewer's anchor when it's a real id
+    # (guards client-supplied data), else map the seed facet through face_ids
+    target: int | None = None
+    if face_ids is not None:
+        target = anchor if (isinstance(anchor, int) and anchor in face_ids) else face_ids[face]
+
+    if precise and target is not None:
+        # Alt-click: the user picked ONE BREP face — describe exactly that face,
+        # with its parent part as context, so the note matches the highlight.
+        region = {i for i, fid in enumerate(face_ids) if fid == target}
+        feature = _feature_label(_faces_meta(run_dir).get(target)) or "face"
+        p = _part_for_face(parts, target)
+        if p and p.get("display"):
+            on_part = p["display"]
+    elif face_ids is not None and parts and (part_meta := _part_for_face(parts, target)) is not None:
+        # Preferred: the sandbox PART TABLE — the clicked facet resolves to the
+        # whole part it belongs to (the bow, not "the torso"), with a unique
+        # display name.
         brep_faces = set(part_meta.get("faces") or [])
         region = {i for i, fid in enumerate(face_ids) if fid in brep_faces}
         display = part_meta.get("display")
         feature = f"`{display}`" if display else _feature_label(_faces_meta(run_dir).get(target))
+        # A part can be the entire model (single-solid builds have ONE part), so
+        # "the `Body`" alone tells the agent nothing about WHERE the user
+        # clicked. Anchor the specific face: its surface type + local position.
+        if len(brep_faces) > 1:
+            seed_centroid = mesh.triangles[face].mean(axis=0)
+            clicked = {
+                "feature": _feature_label(_faces_meta(run_dir).get(target)) or "face",
+                "centroid_mm": [round(float(v), 1) for v in seed_centroid],
+            }
     elif face_ids is not None:
         # part table absent (legacy run): fall back to smooth-region grouping.
         meta_by_id = _faces_meta(run_dir)
-        target = face_ids[face]
         target_region = meta_by_id.get(target, {}).get("region")
         if target_region is not None:
             group = {fid for fid, m in meta_by_id.items() if m.get("region") == target_region}
@@ -247,6 +273,8 @@ def describe_selection(
         "faces": [int(i) for i in idx],
         "display": display,
         "feature": feature,
+        "on_part": on_part,
+        "clicked": clicked,
         "where": _location_words(frac),
         "governed_by": _governing_params(run_dir, region),
         "governed_ready": affect.affect_path(run_dir).exists(),
@@ -325,8 +353,9 @@ def describe_edge(run_dir: Path, edge_id: int) -> dict[str, Any] | None:
 
 
 def _fmt(v: float) -> str:
-    """Compact number: drop a trailing .0 (12.0 -> '12', 6.5 -> '6.5')."""
-    return f"{v:g}"
+    """Compact number: drop a trailing .0 (12.0 -> '12', 6.5 -> '6.5').
+    `+ 0.0` normalizes IEEE negative zero so a rounded -0.04 prints '0', not '-0'."""
+    return f"{v + 0.0:g}"
 
 
 def _geo_anchor(desc: dict[str, Any]) -> str:
@@ -358,11 +387,21 @@ def _face_phrase(desc: dict[str, Any]) -> str:
     where = ", ".join(desc.get("where") or ["center"])
     if display:
         what = f"the `{display}`"
+    elif desc.get("on_part"):
+        # precise (Alt-click) pick: one BREP face, named with its parent part
+        what = f"a {feature} on `{desc['on_part']}` at the {where}"
     elif feature:
         what = f"a {feature} at the {where}"
     else:
         what = f"the {where} region"
-    return what + _geo_anchor(desc) + _gov_tail(desc, "part")
+    out = what + _geo_anchor(desc) + _gov_tail(desc, "part")
+    # part-level picks carry the specific clicked face so "the `Body`" (which
+    # may be the whole model) still tells the agent WHERE the user pointed
+    clicked = desc.get("clicked")
+    if clicked and clicked.get("centroid_mm"):
+        at = ", ".join(_fmt(float(v)) for v in clicked["centroid_mm"])
+        out += f" — the user clicked its {clicked.get('feature') or 'face'} near ({at}) mm"
+    return out
 
 
 def _edge_phrase(desc: dict[str, Any]) -> str:
@@ -376,7 +415,8 @@ def _edge_phrase(desc: dict[str, Any]) -> str:
         what = f"a {desc['feature']} at the {where}"
     length = desc.get("length_mm")
     tail = f", length {length} mm" if length is not None else ""
-    return what + tail + _gov_tail(desc, "edge")
+    # the centroid disambiguates between same-length edges on the same part(s)
+    return what + tail + _geo_anchor(desc) + _gov_tail(desc, "edge")
 
 
 def _wrap_note(phrases: list[str]) -> str | None:
@@ -405,16 +445,73 @@ def selection_note(desc: dict[str, Any]) -> str:
 _MAX_PHRASES = 8  # cap so 50 picks don't produce 50 phrases in the note
 
 
-def build_note(run_dir: Path, faces: list[int] | None = None,
-               edges: list[int] | None = None) -> str | None:
+def _region_phrase(run_dir: Path, region: dict) -> str | None:
+    """Phrase for a brush-painted region. The viewer sends a summary — per-BREP-
+    face coverage percentages plus total area and centroid — never raw facet
+    indices (those don't survive regeneration). Name the covered parts so the
+    agent can scope its change the same way it does for clicked faces."""
+    cov = region.get("face_coverage") or []
+    pairs: list[tuple[int, float]] = []
+    for item in cov[:24]:  # defensive cap on client-supplied data
+        try:
+            fid, pct = item
+            pairs.append((int(fid), float(pct)))
+        except (TypeError, ValueError):
+            continue
+    parts = _load_parts(run_dir)
+    by_part: dict[str, float] = {}
+    loose: list[str] = []
+    for fid, pct in pairs:
+        p = _part_for_face(parts, fid)
+        disp = (p or {}).get("display")
+        if disp:
+            by_part[disp] = max(by_part.get(disp, 0.0), pct)
+        else:
+            loose.append(f"face F{fid} ({pct:.0f}% covered)")
+    bits = [f"{pct:.0f}% of `{d}`" for d, pct in sorted(by_part.items(), key=lambda kv: -kv[1])[:5]]
+    bits += loose[:3]
+    area = region.get("area_mm2")
+    size = ""
+    if isinstance(area, (int, float)) and area > 0:
+        size = f" of ≈{area / 100:.1f} cm²" if area >= 100 else f" of ≈{area:.0f} mm²"
+    c = region.get("centroid")
+    where = ""
+    if isinstance(c, (list, tuple)) and len(c) == 3:
+        try:
+            where = f", centred near ({_fmt(float(c[0]))}, {_fmt(float(c[1]))}, {_fmt(float(c[2]))}) mm"
+        except (TypeError, ValueError):
+            pass
+    if not bits:
+        # a small patch can cover <5% of every (large) face it touches — the
+        # area + centroid still locate it precisely, so never drop it silently
+        if not (size or where):
+            return None
+        return f"a hand-painted surface region{size}{where}"
+    return f"a hand-painted surface region{size}{where}, covering " + ", ".join(bits)
+
+
+def build_note(run_dir: Path, faces: list[int | dict] | None = None,
+               edges: list[int] | None = None,
+               region: dict | None = None) -> str | None:
     """Compose the agent-facing note for a whole selection — any mix of picked
-    faces (by seed facet index) and edges (by id). Picks resolving to the same
-    part are merged, and the list is capped with a '…and N more' summary so a
-    large multi-select stays legible. None if nothing resolves."""
+    faces (a bare seed facet index, or {seed, face: BREP id, precise} from the
+    part-aware viewer), edges (by id), and a brush-painted region summary.
+    Picks resolving to the same part are merged, and the list is capped with a
+    '…and N more' summary so a large multi-select stays legible.
+    None if nothing resolves."""
     # faces: dedupe by part (multiple facets of one part -> one phrase)
     face_by_key: dict[str, dict] = {}
-    for seed in faces or []:
-        d = describe_selection(run_dir, seed)
+    for item in faces or []:
+        if isinstance(item, int):
+            item = {"seed": item}
+        if not isinstance(item, dict) or not isinstance(item.get("seed"), int):
+            continue
+        anchor = item.get("face")
+        d = describe_selection(
+            run_dir, item["seed"],
+            anchor=anchor if isinstance(anchor, int) else None,
+            precise=bool(item.get("precise")),
+        )
         if not d:
             continue
         key = d.get("display") or f"F{tuple(d.get('faces') or [])}"
@@ -445,4 +542,11 @@ def build_note(run_dir: Path, faces: list[int] | None = None,
         extra = len(phrases) - _MAX_PHRASES
         head.append(f"…and {extra} more selected part(s)")
         phrases = head
+
+    # the painted region rides along after the cap — it is one phrase for what
+    # may be the user's most deliberate selection, so it never gets truncated
+    if region:
+        rp = _region_phrase(run_dir, region)
+        if rp:
+            phrases.append(rp)
     return _wrap_note(phrases)

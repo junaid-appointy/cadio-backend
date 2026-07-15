@@ -187,6 +187,12 @@ class Orchestrator:
         self.on_message = on_message
         self.messages: list[dict[str, Any]] = []
         self.last_run_dir: Path | None = None
+        # id + source of the agent's last build, so the API can tell when the
+        # user is looking at a DIFFERENT version than the agent last made (a
+        # manual save, an older version) and anchor the next edit to it. Restored
+        # from history on reconnect (see ProjectSession).
+        self.last_run_id: str | None = None
+        self.last_program: str | None = None
         self.last_usage: dict[str, Any] | None = None  # token/cost/time of the last turn
         self._turn_renders: list[Path] = []  # renders from the current turn's builds
         self._stop = threading.Event()
@@ -259,6 +265,8 @@ class Orchestrator:
         run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         result = self.engine.execute(code, params, run_dir)
         self.last_run_dir = run_dir
+        self.last_run_id = run_dir.name
+        self.last_program = code
         self._emit({"type": "run", "run_id": run_dir.name, "label": label,
                     "result": result.to_dict()})
         if result.ok and result.renders:

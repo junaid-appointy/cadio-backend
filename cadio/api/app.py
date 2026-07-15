@@ -52,9 +52,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-from .. import affect, config, select
+from .. import affect, config, select, versions
 from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
+from ..storage import store as object_store
 from ..store import Store
 from . import auth, history, limits
 from .auth import get_current_user, require_project
@@ -124,7 +125,9 @@ app.add_middleware(
     secret_key=auth.session_secret(),
     session_cookie="cadio_session",
     max_age=30 * 24 * 3600,
-    same_site="lax",
+    # cross-origin frontend => cookie must be SameSite=None; Secure to ride on
+    # its fetch/websocket calls; single-origin stays Lax.
+    same_site=auth.cookie_same_site(),
     https_only=auth.cookie_secure(),
 )
 app.include_router(auth.router)
@@ -135,6 +138,19 @@ app.include_router(auth.router)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 # reject oversized bodies early (added last → outermost → runs before route work)
 app.add_middleware(limits.BodyLimitMiddleware)
+# CORS last so it's the OUTERMOST layer (handles preflight before anything else).
+# Only enabled when the frontend is on its own origin; allow_credentials so the
+# session cookie is accepted cross-site (requires explicit origins, not "*").
+if config.CADIO_FRONTEND_URLS:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CADIO_FRONTEND_URLS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.get("/healthz")
@@ -168,9 +184,34 @@ def _run_payload(pid: str, run: dict) -> dict:
     meta["parent_run_id"] = run.get("parent_run_id")
     if meta.get("ok"):
         base = f"/files/{pid}/runs/{run['run_id']}"
-        meta["artifact_urls"] = {kind: f"{base}/{name}" for kind, name in meta.get("artifacts", {}).items()}
-        meta["program_url"] = f"{base}/program.py"
+        meta["artifact_urls"] = {kind: config.public_url(f"{base}/{name}")
+                                 for kind, name in meta.get("artifacts", {}).items()}
+        meta["program_url"] = config.public_url(f"{base}/program.py")
     return meta
+
+
+def _current_model_note(pid: str, session: "ProjectSession", run_id: str,
+                        live_params: dict | None) -> str | None:
+    """Agent-facing note anchoring the next edit to the version ON SCREEN when it
+    differs from the agent's last build (a manual save, a Code-tab run, or an
+    older version the user scrolled back to). None when they're already in sync —
+    the agent built exactly this run, so its memory already holds the program.
+
+    The program is embedded only when it TEXTUALLY differs from the agent's last
+    build (so a param-only save stays lightweight); the params are always
+    restated so a manual tweak is preserved instead of reset to the defaults."""
+    if run_id == session.orch.last_run_id:
+        return None
+    run = store.get_run(pid, run_id)
+    if not run or not run.get("ok"):
+        return None
+    prog_path = config.project_runs_dir(pid) / run_id / "program.py"
+    program = prog_path.read_text() if prog_path.exists() else None
+    include_program = bool(program) and program.strip() != (session.orch.last_program or "").strip()
+    baseline = run["meta"].get("params") or {}
+    params = live_params or baseline
+    return versions.current_model_note(
+        versions.version_name(run), run_id, params, program if include_program else None)
 
 
 def _result_to_meta(run_id: str, result_dict: dict) -> dict:
@@ -184,14 +225,23 @@ def _result_to_meta(run_id: str, result_dict: dict) -> dict:
 
 
 def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
-              parent_run_id: str | None = None) -> dict:
+              parent_run_id: str | None = None, origin: str = "agent") -> dict:
     meta = _result_to_meta(run_id, result_dict)
-    run = store.add_run(pid, run_id, label, bool(meta.get("ok")), meta, parent_run_id)
+    run = store.add_run(pid, run_id, label, bool(meta.get("ok")), meta, parent_run_id,
+                        origin=origin)
     # precompute the parameter→affected-faces map in the background so clicking a
     # parameter highlights instantly (see /affect endpoint for the lazy fallback)
     if meta.get("ok") and meta.get("manifest"):
         run_dir = config.project_runs_dir(pid) / run_id
         _ensure_precompute(run_dir, result_dict.get("params", {}), result_dict.get("manifest", []))
+    # mirror the run's artifacts to R2 (durable copy; local disk stays a cache).
+    # Best-effort and off the request path — inert when R2 is disabled.
+    if meta.get("ok") and object_store.enabled:
+        run_dir = config.project_runs_dir(pid) / run_id
+        threading.Thread(
+            target=lambda: object_store.put_dir(run_dir, f"{pid}/runs/{run_id}"),
+            daemon=True,
+        ).start()
     return _run_payload(pid, run)
 
 
@@ -355,6 +405,8 @@ def run_facemap(pid: str, run_id: str, user: dict = Depends(get_current_user)):
 
 class SelectRequest(BaseModel):
     face: int
+    anchor: int | None = None  # BREP face id the viewer resolved the click to
+    precise: bool = False  # Alt-click: describe the single BREP face, not its part
 
 
 @app.post("/api/projects/{pid}/runs/{run_id}/select")
@@ -366,7 +418,7 @@ def run_select(pid: str, run_id: str, req: SelectRequest, user: dict = Depends(g
     if not run:
         return JSONResponse({"error": "run not found"}, status_code=404)
     run_dir = config.project_runs_dir(pid) / run_id
-    desc = select.describe_selection(run_dir, req.face)
+    desc = select.describe_selection(run_dir, req.face, anchor=req.anchor, precise=req.precise)
     if desc is None:
         return JSONResponse({"error": "could not resolve selection"}, status_code=422)
     desc["note"] = select.selection_note(desc)
@@ -412,7 +464,8 @@ def preview(req: PreviewRequest, user: dict = Depends(rate_limit("preview", 120,
     meta["preview"] = True
     if result.ok:
         meta["artifact_urls"] = {
-            kind: f"/previews/{pdir.name}/{Path(p).name}" for kind, p in result.artifacts.items()
+            kind: config.public_url(f"/previews/{pdir.name}/{Path(p).name}")
+            for kind, p in result.artifacts.items()
         }
     _prune_previews()
     return JSONResponse(meta, status_code=200 if result.ok else 422)
@@ -428,7 +481,15 @@ def project_execute(pid: str, req: ExecuteRequest, user: dict = Depends(rate_lim
     try:
         run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time()*1000)%1000:03d}"
         result = engine.execute(req.code, req.params, config.project_runs_dir(pid) / run_id)
-        payload = _save_run(pid, run_id, result.to_dict(), req.label or "", req.parent_run_id)
+        payload = _save_run(pid, run_id, result.to_dict(), req.label or "", req.parent_run_id,
+                            origin="manual")
+        # a manual save is a checkpoint in the conversation: record a UI-only
+        # marker so it shows as a chip in the chat (live + on reload) the same
+        # way an agent build shows a run card. Kept distinct from a "run" event
+        # (kind=checkpoint) because its program is NOT in the agent's LLM memory —
+        # the current-model note is what feeds it back to the agent, not replay.
+        if result.ok:
+            store.add_message(pid, "event", {"kind": "checkpoint", "run_id": run_id})
     finally:
         limits.release_build_slot(user["id"])
     return JSONResponse(payload, status_code=200 if result.ok else 422)
@@ -463,6 +524,14 @@ async def upload_asset(pid: str, file: UploadFile, user: dict = Depends(rate_lim
     fname = f"{asset_id}{store_ext}"
     config.project_refs_dir(pid).mkdir(parents=True, exist_ok=True)
     (config.project_refs_dir(pid) / fname).write_bytes(data)
+    # reference uploads are NOT regenerable, so mirror them to R2 durably (best-
+    # effort; the local copy stays as the cache). Served via the same /files
+    # fallback as run artifacts.
+    if object_store.enabled:
+        threading.Thread(
+            target=lambda: object_store.put(f"{pid}/refs/{fname}", data, store_mime),
+            daemon=True,
+        ).start()
     name = Path(file.filename or "file").name[:80]
     return store.add_asset(pid, asset_id, fname, name, store_mime)
 
@@ -530,6 +599,24 @@ class ProjectSession:
         if records:
             self.orch.set_history(
                 history.to_llm_messages(records, self._asset_path, max_turns=HISTORY_MAX_TURNS))
+            self._restore_agent_anchor(records)
+
+    def _restore_agent_anchor(self, records: list[dict]) -> None:
+        """After a reconnect the orchestrator is rebuilt from the DB with an empty
+        last_run_id/last_program. Recover the id + program of the agent's LAST
+        build (a 'run' event, never a manual 'checkpoint' — those aren't in the
+        agent's memory) so the current-model note only fires when the on-screen
+        version really differs from what the agent built."""
+        for rec in reversed(records):
+            if rec["role"] == "event" and rec["content"].get("kind") == "run":
+                rid = rec["content"].get("run_id")
+                if not rid:
+                    return
+                self.orch.last_run_id = rid
+                prog = config.project_runs_dir(self.pid) / str(rid) / "program.py"
+                if prog.exists():
+                    self.orch.last_program = prog.read_text()
+                return
 
     # --- client attach/detach (called from the event loop) ---
     def attach(self, sink: Callable[[dict], None]) -> tuple[bool, list[dict] | None]:
@@ -740,16 +827,39 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
                     glines = "\n".join(f"- id={g['id']} ({g['name']})" for g in geometry)
                     text += ("\n\n[Reference geometry attached — measure with "
                              f"inspect_geometry before asking for known dimensions:\n{glines}]")
-                # picked model parts: {"run_id", "faces":[seed facet idx], "edges":[id]}
+                # picked model parts: {"run_id", "faces":[seed facet idx | {seed,
+                # face: BREP id, precise}], "edges":[id], "region": brush summary}
                 sel = data.get("selection")
                 if isinstance(sel, dict) and sel.get("run_id"):
-                    faces = [f for f in (sel.get("faces") or []) if isinstance(f, int)]
+                    faces: list[int | dict] = []
+                    for f in (sel.get("faces") or []):
+                        if isinstance(f, int):
+                            faces.append(f)
+                        elif isinstance(f, dict) and isinstance(f.get("seed"), int):
+                            faces.append({
+                                "seed": f["seed"],
+                                "face": f["face"] if isinstance(f.get("face"), int) else None,
+                                "precise": bool(f.get("precise")),
+                            })
                     edges = [e for e in (sel.get("edges") or []) if isinstance(e, int)]
-                    if (faces or edges) and store.get_run(pid, str(sel["run_id"])):
+                    region = sel.get("region") if isinstance(sel.get("region"), dict) else None
+                    if (faces or edges or region) and store.get_run(pid, str(sel["run_id"])):
                         note = select.build_note(
-                            config.project_runs_dir(pid) / str(sel["run_id"]), faces, edges)
+                            config.project_runs_dir(pid) / str(sel["run_id"]),
+                            faces, edges, region)
                         if note:
                             text += "\n\n" + note
+                # anchor the edit to the version the user is actually looking at:
+                # {run_id, params} of the on-screen model. Injected only when it
+                # differs from the agent's last build (manual save / older version)
+                # so the agent edits what's on screen instead of its stale copy.
+                cur = data.get("current")
+                if isinstance(cur, dict) and cur.get("run_id"):
+                    cnote = _current_model_note(
+                        pid, session, str(cur["run_id"]),
+                        cur["params"] if isinstance(cur.get("params"), dict) else None)
+                    if cnote:
+                        text += "\n\n" + cnote
                 err = session.start_turn(text, images)
                 if err:
                     await ws.send_json({"type": "error", "message": err})
@@ -815,9 +925,15 @@ _IMMUTABLE = "public, max-age=31536000, immutable"
 @app.get("/files/{pid}/{path:path}")
 def project_file(pid: str, path: str, user: dict = Depends(get_current_user)):
     require_project(pid, user)
-    target = _safe_file(config.project_dir(pid), path)
-    if target is None:
+    base = config.project_dir(pid)
+    target = (base / path).resolve()
+    if not target.is_relative_to(base.resolve()):
         return JSONResponse({"error": "not found"}, status_code=404)
+    if not target.is_file():
+        # local cache miss (fresh/ephemeral container, or an evicted artifact):
+        # repopulate from R2 if we have a durable copy there, else it's gone.
+        if not object_store.download_to(f"{pid}/{path}", target):
+            return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(target, headers={"Cache-Control": _IMMUTABLE})
 
 
@@ -846,8 +962,10 @@ if FRONTEND_DIST.exists():
 else:
     @app.get("/")
     def index():
+        # Standalone API image (frontend ships as its own container). `/` is a
+        # benign 200 so edge/load-balancer health checks that probe the root pass
+        # — the SPA lives at its own origin; see /healthz for the liveness probe.
         return JSONResponse(
-            {"detail": "frontend not built — run `npm run build` in frontend/, "
-                       "or use the Vite dev server (`npm run dev`)"},
-            status_code=503,
+            {"service": "cadio-api", "ok": True,
+             "detail": "CADIO API — the web UI runs as a separate frontend."},
         )

@@ -88,3 +88,101 @@ _migrate_repo_leftover(REPO_ROOT / ".sandbox_home", SANDBOX_HOME)
 
 for _d in (PROJECTS_DIR, PREVIEW_DIR, SANDBOX_HOME):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+# ---- database backend ------------------------------------------------------
+# Metadata lives in SQLite by default (single box, ~$0). Set DATABASE_URL to a
+# Postgres/Supabase connection string to switch the whole Store over — nothing
+# else changes. Use Supabase's *pooled* connection string (port 6543) for the app.
+#   postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:6543/postgres
+DATABASE_URL = os.environ.get("DATABASE_URL") or None
+
+
+def is_postgres() -> bool:
+    return bool(DATABASE_URL) and DATABASE_URL.split(":", 1)[0] in ("postgres", "postgresql")
+
+
+# ---- object storage (Cloudflare R2) ----------------------------------------
+# Run artifacts live on local disk by default (a write-through cache). When the
+# R2_* creds below are all present, the disk becomes a cache in front of R2, and
+# R2 holds the durable copy. R2 has NO hard spend cap, so we enforce the free
+# tier ourselves: the caps below are checked in cadio/storage.py before every
+# billable operation (storage bytes via LRU eviction, Class A/B ops via a
+# monthly counter in the DB). Headroom is deliberate — stay UNDER the real limit.
+def _env_str(name: str) -> str | None:
+    """Read an env var, tolerating a stray inline comment. Docker's --env-file
+    keeps everything after `=` verbatim (`VAR=val # note` -> `val # note`), so a
+    value that is ENTIRELY a comment is treated as unset."""
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    v = v.strip()
+    if v.startswith("#"):
+        return None
+    return v or None
+
+
+R2_ACCOUNT_ID = _env_str("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = _env_str("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = _env_str("R2_SECRET_ACCESS_KEY")
+R2_BUCKET = _env_str("R2_BUCKET")
+# optional explicit endpoint; only accept a real URL, else derive from account id
+_endpoint = _env_str("R2_ENDPOINT")
+if _endpoint and not _endpoint.startswith("http"):
+    _endpoint = None
+R2_ENDPOINT = _endpoint or (
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+# free-tier caps (with headroom under 10 GB / 1M / 10M)
+R2_MAX_STORAGE_BYTES = _env_int("R2_MAX_STORAGE_BYTES", 9_500_000_000)   # 9.5 GB
+R2_MAX_CLASS_A_OPS = _env_int("R2_MAX_CLASS_A_OPS", 950_000)             # writes/mo
+R2_MAX_CLASS_B_OPS = _env_int("R2_MAX_CLASS_B_OPS", 9_500_000)          # reads/mo
+
+
+def r2_enabled() -> bool:
+    return all((R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT))
+
+
+# ---- split deploy (separate frontend / backend origins) --------------------
+# When the frontend is served from its OWN origin (a different container/host)
+# and reaches this API over the network, set these. Left unset, the app stays
+# single-origin (the backend serves the SPA) and nothing below changes.
+#   CADIO_FRONTEND_URL  comma-separated allowed browser origin(s) of the frontend
+#                       — enables CORS (with credentials) and is where OAuth
+#                       returns the user after sign-in.
+#   CADIO_PUBLIC_URL    this backend's OWN public base URL, so artifact/preview
+#                       links come back absolute (…/files/…) and load from the
+#                       API origin instead of the frontend's.
+CADIO_FRONTEND_URLS = [u.strip().rstrip("/") for u in
+                       os.environ.get("CADIO_FRONTEND_URL", "").split(",") if u.strip()]
+CADIO_PUBLIC_URL = (os.environ.get("CADIO_PUBLIC_URL", "").strip().rstrip("/") or None)
+
+
+def cross_site() -> bool:
+    """True when the frontend is on a different origin (cookies must be
+    SameSite=None; Secure and CORS must allow credentials)."""
+    return bool(CADIO_FRONTEND_URLS)
+
+
+def public_url(path: str) -> str:
+    """Absolutize a backend-relative path (/files/…, /previews/…) using
+    CADIO_PUBLIC_URL when set, so a cross-origin frontend loads it from the API
+    origin. No-op (returns the path unchanged) in single-origin mode."""
+    if CADIO_PUBLIC_URL and path.startswith("/"):
+        return CADIO_PUBLIC_URL + path
+    return path
+
+
+def frontend_home() -> str:
+    """Where to send the browser after OAuth: the frontend origin when split,
+    else same-origin root."""
+    return CADIO_FRONTEND_URLS[0] if CADIO_FRONTEND_URLS else "/"

@@ -1,0 +1,20 @@
+# build inputs only — keep the image small & the context fast
+.git
+.venv
+**/__pycache__
+**/*.pyc
+node_modules
+frontend/node_modules
+frontend/dist
+.env
+.env.*
+!.env.example
+docs
+tests
+*.md
+.DS_Store
+# never ship local runtime data / caches
+.cadio
+.forma
+data
+scratchpad

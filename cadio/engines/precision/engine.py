@@ -218,6 +218,20 @@ class PrecisionEngine:
                 continue
             validation.issues.append(ValidationIssue("warning", str(code), str(msg)))
 
+        # part-drift regression guard: a scoped edit ("thicker handle") that
+        # silently moved or shrank UNRELATED parts shows up as a warning in the
+        # agent's tool result, and the standing fix-validation-issues rule makes
+        # it restore them (or confirm the change was requested). Never blocks.
+        if not preview:
+            try:
+                from ...validation.drift import part_drift_issue
+
+                drift = part_drift_issue(run_dir, raw.get("bbox"))
+                if drift:
+                    validation.issues.append(drift)
+            except Exception:
+                pass  # the guard must never break a build
+
         # renders are the agent's eyes + the project thumbnail — non-preview only
         renders: dict[str, str] = {}
         if not preview:

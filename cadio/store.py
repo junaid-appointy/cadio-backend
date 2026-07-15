@@ -1,11 +1,19 @@
-"""Project store — SQLite persistence for projects, conversations, runs, assets.
+"""Project store — SQLite or Postgres persistence for projects, conversations,
+runs, assets.
 
-Files stay on disk (config.project_*_dir); the DB holds metadata only.
+Backend is chosen by DATABASE_URL (see cadio/db.py): SQLite by default, or
+Supabase/Postgres when the env var is set. The query code below is the same for
+both — `db.open_connection` gives a connection that translates placeholders, and
+the two dialect-specific spots (row upserts, message autoincrement) go through
+`db.upsert_sql` / a small branch.
 
-Connections are PER-THREAD (a thread-local): under WAL, many readers run
-concurrently, so the request threadpool no longer serializes every query behind
-one shared connection. Writes still take a process-wide lock (`_wlock`) so
-concurrent writers never hit SQLITE_BUSY. The worker pool never touches the DB.
+Files stay on disk (config.project_*_dir) / R2 (cadio/storage.py); the DB holds
+metadata only.
+
+Connections are PER-THREAD (a thread-local): under SQLite WAL many readers run
+concurrently; Postgres runs autocommit so reads never hold a transaction open.
+Writes still take a process-wide lock (`_wlock`) so writers never race. The
+worker pool never touches the DB.
 
 Message records are stored in a persistence-friendly, base64-free shape (user
 messages reference image assets by id, not inline data) so the same rows drive
@@ -15,61 +23,12 @@ both LLM-history replay and UI scrollback — see cadio/api/history.py.
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
 
-from . import config
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id          TEXT PRIMARY KEY,
-    google_sub  TEXT UNIQUE,
-    email       TEXT UNIQUE NOT NULL,
-    name        TEXT,
-    picture     TEXT,
-    created_at  TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS projects (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    archived_at TEXT,
-    thumb_run   TEXT,
-    user_id     TEXT              -- owner; NULL for pre-auth projects (adopted by first user)
-);
-CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    role       TEXT NOT NULL,          -- user|assistant|tool|event
-    content    TEXT NOT NULL,          -- JSON payload
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);
-CREATE TABLE IF NOT EXISTS runs (
-    id            TEXT NOT NULL,       -- run_id (unique within a project)
-    project_id    TEXT NOT NULL REFERENCES projects(id),
-    parent_run_id TEXT,                -- tweak lineage -> version tree
-    label         TEXT,
-    ok            INTEGER NOT NULL,
-    meta          TEXT NOT NULL,       -- JSON (engine result payload)
-    created_at    TEXT NOT NULL,
-    PRIMARY KEY (project_id, id)
-);
-CREATE TABLE IF NOT EXISTS assets (
-    id         TEXT NOT NULL,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    file       TEXT NOT NULL,
-    name       TEXT NOT NULL,
-    mime       TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (project_id, id)
-);
-"""
+from . import config, db
 
 
 def _now() -> str:
@@ -82,28 +41,26 @@ def _new_id() -> str:
 
 class Store:
     def __init__(self, db_path: Path | None = None):
-        self.db_path = Path(db_path or config.DB_PATH)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._wlock = threading.Lock()   # serializes writers (avoids SQLITE_BUSY)
-        self._local = threading.local()  # one sqlite connection per thread
+        self.db_path = None if db_path is None else Path(db_path)
+        if not config.is_postgres():
+            path = self.db_path or config.DB_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+        self._wlock = threading.Lock()   # serializes writers
+        self._local = threading.local()  # one connection per thread
         conn = self._conn()
         with self._wlock:
-            conn.executescript(_SCHEMA)
+            for stmt in db.schema_statements():
+                conn.execute(stmt)
             conn.commit()
         self._migrate_add_project_owner()
         self._migrate_legacy_flat()
 
-    def _conn(self) -> sqlite3.Connection:
-        """This thread's connection, opened lazily. WAL lets readers run without
-        blocking each other or the single writer; busy_timeout makes a writer wait
-        for a brief lock rather than erroring."""
+    def _conn(self):
+        """This thread's connection, opened lazily. SQLite uses WAL so readers
+        never block; Postgres runs autocommit through the Supabase pooler."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(str(self.db_path))
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn = db.open_connection(self.db_path)
             self._local.conn = conn
         return conn
 
@@ -111,6 +68,10 @@ class Store:
         """Add projects.user_id on databases created before multi-user (the
         CREATE TABLE above only adds it to fresh DBs). Idempotent."""
         with self._wlock:
+            if config.is_postgres():
+                self._conn().execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS user_id TEXT")
+                self._conn().commit()
+                return
             cols = {r["name"] for r in self._conn().execute("PRAGMA table_info(projects)").fetchall()}
             if "user_id" not in cols:
                 self._conn().execute("ALTER TABLE projects ADD COLUMN user_id TEXT")
@@ -169,7 +130,7 @@ class Store:
         row = self._conn().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         return self._user_row(row) if row else None
 
-    def _user_row(self, row: sqlite3.Row) -> dict:
+    def _user_row(self, row) -> dict:
         return {"id": row["id"], "email": row["email"], "name": row["name"],
                 "picture": row["picture"], "created_at": row["created_at"]}
 
@@ -240,12 +201,14 @@ class Store:
             self._conn().commit()
         import shutil as _sh
         _sh.rmtree(config.project_dir(pid), ignore_errors=True)
+        from .storage import store as _obj  # drop the durable R2 copies too (free)
+        _obj.delete_prefix(f"{pid}/")
         return True
 
     def _touch(self, pid: str) -> None:
         self._conn().execute("UPDATE projects SET updated_at=? WHERE id=?", (_now(), pid))
 
-    def _project_row(self, row: sqlite3.Row, model_count: int | None = None) -> dict:
+    def _project_row(self, row, model_count: int | None = None) -> dict:
         # list_projects passes model_count from its aggregate; the single-project
         # path computes it on demand (one small indexed COUNT).
         if model_count is None:
@@ -268,13 +231,20 @@ class Store:
     def add_message(self, pid: str, role: str, content: dict) -> dict:
         now = _now()
         with self._wlock:
-            cur = self._conn().execute(
-                "INSERT INTO messages(project_id, role, content, created_at) VALUES (?,?,?,?)",
-                (pid, role, json.dumps(content), now),
-            )
+            if config.is_postgres():
+                mid = self._conn().execute(
+                    "INSERT INTO messages(project_id, role, content, created_at) "
+                    "VALUES (?,?,?,?) RETURNING id",
+                    (pid, role, json.dumps(content), now),
+                ).fetchone()["id"]
+            else:
+                cur = self._conn().execute(
+                    "INSERT INTO messages(project_id, role, content, created_at) VALUES (?,?,?,?)",
+                    (pid, role, json.dumps(content), now),
+                )
+                mid = cur.lastrowid
             self._touch(pid)
             self._conn().commit()
-            mid = cur.lastrowid
         return {"id": mid, "role": role, "content": content, "created_at": now}
 
     def get_messages(self, pid: str) -> list[dict]:
@@ -289,12 +259,24 @@ class Store:
     # ---- runs -------------------------------------------------------------
 
     def add_run(self, pid: str, run_id: str, label: str, ok: bool, meta: dict,
-                parent_run_id: str | None = None, created_at_override: str | None = None) -> dict:
+                parent_run_id: str | None = None, created_at_override: str | None = None,
+                origin: str = "agent") -> dict:
         now = created_at_override or _now()
         with self._wlock:
+            # stamp a stable, monotonic per-project version number + its origin
+            # (agent build vs manual save) so the UI can show "v3" and a build/
+            # tweak icon without re-deriving order client-side. `id <> ?` keeps a
+            # defensive re-upsert of the same run from inflating the count.
+            seq = self._conn().execute(
+                "SELECT COUNT(*) c FROM runs WHERE project_id=? AND id <> ?", (pid, run_id)
+            ).fetchone()["c"] + 1
+            meta = {**meta, "seq": seq, "origin": origin}
             self._conn().execute(
-                "INSERT OR REPLACE INTO runs(id, project_id, parent_run_id, label, ok, meta, created_at)"
-                " VALUES (?,?,?,?,?,?,?)",
+                db.upsert_sql(
+                    "runs",
+                    ["id", "project_id", "parent_run_id", "label", "ok", "meta", "created_at"],
+                    ["project_id", "id"],
+                ),
                 (run_id, pid, parent_run_id, label, int(ok), json.dumps(meta), now),
             )
             # first successful run becomes the project thumbnail
@@ -319,7 +301,7 @@ class Store:
         ).fetchone()
         return self._run_row(row) if row else None
 
-    def _run_row(self, row: sqlite3.Row) -> dict:
+    def _run_row(self, row) -> dict:
         meta = json.loads(row["meta"])
         return {
             "run_id": row["id"],
@@ -332,7 +314,7 @@ class Store:
         }
 
     def _run_file_url(self, pid: str, run_id: str, name: str) -> str:
-        return f"/files/{pid}/runs/{run_id}/{name}"
+        return config.public_url(f"/files/{pid}/runs/{run_id}/{name}")
 
     # ---- assets -----------------------------------------------------------
 
@@ -340,7 +322,11 @@ class Store:
         now = _now()
         with self._wlock:
             self._conn().execute(
-                "INSERT OR REPLACE INTO assets(id, project_id, file, name, mime, created_at) VALUES (?,?,?,?,?,?)",
+                db.upsert_sql(
+                    "assets",
+                    ["id", "project_id", "file", "name", "mime", "created_at"],
+                    ["project_id", "id"],
+                ),
                 (asset_id, pid, file, name, mime, now),
             )
             self._touch(pid)
@@ -365,6 +351,8 @@ class Store:
             self._touch(pid)
             self._conn().commit()
         (config.project_refs_dir(pid) / row["file"]).unlink(missing_ok=True)
+        from .storage import store as _obj
+        _obj.delete_prefix(f"{pid}/refs/{row['file']}")
         return True
 
     def get_asset(self, pid: str, asset_id: str) -> dict | None:
@@ -378,7 +366,7 @@ class Store:
     def _asset_dict(self, pid: str, aid: str, file: str, name: str, mime: str, created_at: str) -> dict:
         return {
             "id": aid, "file": file, "name": name, "mime": mime, "created_at": created_at,
-            "url": f"/files/{pid}/refs/{file}",
+            "url": config.public_url(f"/files/{pid}/refs/{file}"),
         }
 
     # ---- migration --------------------------------------------------------

@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "fastapi",
+    "python-multipart",            # FastAPI file uploads (UploadFile / Form)
     "uvicorn[standard]",
     "litellm",
     "pydantic",
@@ -21,6 +22,8 @@ dependencies = [
     "httpx>=0.28.1",
     "fast-simplification>=0.1.13",
     "networkx>=3.4.2",
+    "psycopg[binary,pool]>=3.2",   # Supabase/Postgres backend (optional at runtime; used when DATABASE_URL is set)
+    "boto3>=1.34",                 # Cloudflare R2 (S3-compatible) object storage (optional; used when R2_* env is set)
 ]
 
 [project.scripts]

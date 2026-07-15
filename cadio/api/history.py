@@ -11,7 +11,8 @@ Stored record shapes (role -> content JSON):
   user      {"text": str, "image_asset_ids": [id, ...]}
   assistant {"content": str, "tool_calls": [...], "usage": {...}?}  # usage on the final msg
   tool      {"tool_call_id": str, "content": str}          # LLM-native
-  event     {"kind": "run", "run_id": str}                 # UI-only marker
+  event     {"kind": "run"|"checkpoint", "run_id": str}    # UI-only marker
+              # run = agent build; checkpoint = manual save (Params/Code tab)
 """
 
 from __future__ import annotations
@@ -90,8 +91,11 @@ def to_ui_items(records: list[dict], run_lookup: Callable[[str], dict | None],
                 if content.get("usage"):  # token/cost/time attached to the final message
                     item["usage"] = content["usage"]
                 items.append(item)
-        elif role == "event" and content.get("kind") == "run":
+        elif role == "event" and content.get("kind") in ("run", "checkpoint"):
+            # 'run' = an agent build (a full run card); 'checkpoint' = a manual
+            # save (a compact chip). Both point at a run's meta by id.
             meta = run_lookup(content["run_id"])
             if meta:
-                items.append({"kind": "run", "meta": meta})
+                kind = "run" if content["kind"] == "run" else "checkpoint"
+                items.append({"kind": kind, "meta": meta})
     return items
