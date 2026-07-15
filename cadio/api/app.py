@@ -721,13 +721,15 @@ class ProjectSession:
         try:
             reply = self.orch.send(text, images)
             self.deliver({"type": "assistant", "text": reply})
-        except Exception:
+        except Exception as exc:
             if self.orch.messages and self.orch.messages[-1].get("role") == "user":
                 self.orch.messages.pop()
             ref = uuid.uuid4().hex[:6]
             log.error("session %s turn failed ref=%s", self.pid, ref, exc_info=True)
+            # TEMP debug (dev only): surface the real exception to the client so we
+            # can diagnose without pod logs. REVERT to the generic message after.
             self.deliver({"type": "error",
-                          "message": f"Something went wrong handling that request. Please try again. (ref {ref})"})
+                          "message": f"[debug {type(exc).__name__}] {str(exc)[:600]} (ref {ref})"})
         finally:
             limits.release_build_slot(self.uid)
             with self.lock:
