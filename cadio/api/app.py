@@ -721,15 +721,13 @@ class ProjectSession:
         try:
             reply = self.orch.send(text, images)
             self.deliver({"type": "assistant", "text": reply})
-        except Exception as exc:
+        except Exception:
             if self.orch.messages and self.orch.messages[-1].get("role") == "user":
                 self.orch.messages.pop()
             ref = uuid.uuid4().hex[:6]
             log.error("session %s turn failed ref=%s", self.pid, ref, exc_info=True)
-            # TEMP debug (dev only): surface the real exception to the client so we
-            # can diagnose without pod logs. REVERT to the generic message after.
             self.deliver({"type": "error",
-                          "message": f"[debug {type(exc).__name__}] {str(exc)[:600]} (ref {ref})"})
+                          "message": f"Something went wrong handling that request. Please try again. (ref {ref})"})
         finally:
             limits.release_build_slot(self.uid)
             with self.lock:
@@ -813,7 +811,10 @@ async def ws_chat(ws: WebSocket, project: str | None = None):
                 if data.get("model"):
                     session.orch.model = data["model"]
                 session.orch.api_key = data.get("api_key") or None
-                await ws.send_json({"type": "ready", "model": session.orch.model})
+                # busy => a turn from a previous connection is still running and we
+                # just adopted it; tell the client so the thinking dots make sense.
+                await ws.send_json({"type": "ready", "model": session.orch.model,
+                                    "busy": session.busy})
             elif kind == "chat" and data.get("text", "").strip():
                 if not chat_bucket.take():
                     await ws.send_json({"type": "error",
