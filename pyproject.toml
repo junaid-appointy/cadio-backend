@@ -16,6 +16,7 @@ dependencies = [
     "python-multipart",            # FastAPI file uploads (UploadFile / Form)
     "uvicorn[standard]",
     "litellm",
+    "orjson",                      # litellm imports it on the completion path; not always pulled in transitively
     "pydantic",
     "authlib>=1.7.2",
     "itsdangerous>=2.2.0",
