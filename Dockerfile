@@ -26,6 +26,9 @@ COPY pyproject.toml ./
 COPY cadio/ ./cadio/
 RUN --mount=type=cache,target=/root/.cache/pip pip install .
 
+# starter program served by GET /api/example (read from /app/examples at runtime)
+COPY examples/ ./examples/
+
 # runtime data (SQLite when no DATABASE_URL, plus the local artifact cache that
 # fronts R2) lives on a volume so it survives container restarts.
 ENV CADIO_HOME=/data \
