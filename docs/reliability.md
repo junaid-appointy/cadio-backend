@@ -74,9 +74,11 @@ your load balancer / supervisor liveness check here.
 6. **Backups**: Litestream sidecar for the SQLite DB + periodic `tar` of
    `~/.cadio/projects` (see `storage-decision.md`).
 
-## Memory discipline (the 3GB-container OOM incident, 2026-07-16)
+## Memory discipline (the 2GB-container OOM incident, 2026-07-16)
 
-The deployed backend (Bifrost `heavy` tier ≈ 3GB, no swap) crash-looped under
+The deployed backend (Bifrost `heavy` tier = **2048MB cgroup limit** per
+`/healthz` `mem.limit_mb` — not the 3GB the instance size suggests; no swap)
+crash-looped under
 use while the same code ran fine on an 8GB MacBook (macOS absorbs pressure with
 swap + compression; a cgroup answers with SIGKILL). Root causes, all fixed:
 
@@ -109,11 +111,19 @@ swap + compression; a cgroup answers with SIGKILL). Root causes, all fixed:
    `python -I` subprocess of `measure.py`. The renderer also reuses the
    validated mesh instead of re-reading the STL (one in-memory copy per build).
 
-Measured floors (Python 3.12, this dependency set): API process ~245MB idle
+Measured floors (Python 3.12, this dependency set): API process ~220MB at boot
 (litellm alone is ~130MB); each kernel worker ~360MB idle, spiking with
-geometry. Budget for a 3GB container: main + 2 workers ≈ 1GB steady state,
-2-build concurrency cap, headroom for spikes. `/healthz` reports cgroup
-limit/usage — watch `used_pct` after builds.
+geometry. Budget for the 2GB tier: main + 2 workers ≈ 950MB steady state,
+2-build concurrency cap, ~1GB headroom for geometry spikes. `/healthz` reports
+cgroup limit/usage — watch `used_pct` after builds. Verified in a local
+`docker run --memory=2g` of the production image: boot 8s, healthz 200,
+warm pool jobs 20–40ms.
+
+Deploy note: a big dependency-layer rebuild makes the image's new layers
+slow to pull; the platform's deploy workflow can time out and mark the
+deployment `failed` even though the build succeeded and the code is healthy —
+verify with a local `docker build` + `docker run` before assuming a code
+failure, then redeploy.
 
 ## Known gaps (future hardening)
 
