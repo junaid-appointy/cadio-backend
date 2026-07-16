@@ -153,11 +153,39 @@ if config.CADIO_FRONTEND_URLS:
     )
 
 
+def _mem_stats() -> dict:
+    """Container memory ceiling + current usage, read straight from the cgroup so
+    we can tell (from outside the cluster) whether builds are OOM-killing the pod.
+    Values in MB. Best-effort: returns {} if the files aren't present."""
+    def _read_int(path: str) -> int | None:
+        try:
+            v = open(path).read().strip()
+            return int(v) if v.isdigit() else None
+        except Exception:
+            return None
+
+    mb = lambda b: round(b / 1048576) if b is not None else None
+    # cgroup v2 first, then v1
+    limit = _read_int("/sys/fs/cgroup/memory.max") or _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    usage = _read_int("/sys/fs/cgroup/memory.current") or _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    out: dict = {"limit_mb": mb(limit), "usage_mb": mb(usage)}
+    # peak RSS of this process (ru_maxrss is KB on Linux)
+    try:
+        import resource
+        out["rss_peak_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+    except Exception:
+        pass
+    if out.get("limit_mb") and out.get("usage_mb"):
+        out["used_pct"] = round(100 * out["usage_mb"] / out["limit_mb"])
+    return out
+
+
 @app.get("/healthz")
 def healthz():
     """Liveness probe for supervisors / load balancers — unauthenticated, no DB
     or engine work, so it stays green even under load and never leaks state."""
-    return {"ok": True, "connections": len(_active_ws), "inflight_builds": _inflight_build_count()}
+    return {"ok": True, "connections": len(_active_ws), "inflight_builds": _inflight_build_count(),
+            "mem": _mem_stats()}
 
 
 # Developer-only diagnostics. These logs are for us (server console), never shown
