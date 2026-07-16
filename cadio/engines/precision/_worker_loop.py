@@ -9,7 +9,11 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# APPEND, never insert(0): this directory must not shadow the stdlib. (A module
+# here named `inspect.py` once sat in front of stdlib `inspect` and broke the
+# build123d import chain, so no worker ever booted and every build silently ran
+# on the ~360MB cold path — the source of the production OOM crashes.)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import build123d  # noqa: F401  — the ~3s import, done once per worker
 import _sandbox_runner as lib

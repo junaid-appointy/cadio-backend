@@ -31,9 +31,14 @@ COPY examples/ ./examples/
 
 # runtime data (SQLite when no DATABASE_URL, plus the local artifact cache that
 # fronts R2) lives on a volume so it survives container restarts.
+# MALLOC_ARENA_MAX=2: the API process is thread-heavy (turn threads, affect
+# builds, R2 uploads); glibc's default of 8 arenas/core fragments hundreds of
+# MB of RSS in a memory-capped container. Two arenas costs negligible lock
+# contention at this concurrency and keeps RSS honest.
 ENV CADIO_HOME=/data \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    MALLOC_ARENA_MAX=2
 RUN mkdir -p /data
 VOLUME ["/data"]
 

@@ -698,7 +698,7 @@ class ProjectSession:
         return p if p.exists() else None
 
     def _inspect_asset(self, aid: str) -> dict:
-        from ..engines.precision.inspect import inspect_geometry
+        from ..engines.precision.measure import inspect_geometry
         p = self._asset_path(aid)
         if not p:
             return {"error": f"no such reference geometry: {aid!r}"}

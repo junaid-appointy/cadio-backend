@@ -20,6 +20,7 @@ timeout. TODO(P1): no-network Docker with resource limits (plan §6.3).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -30,9 +31,15 @@ from typing import Any
 
 from ..base import ExecutionResult, ParamSpec, ValidationReport
 from ...validation.mesh import validate_mesh
-from .pool import WorkerError, WorkerPool
+from .pool import WorkerJobError, WorkerPool, WorkerUnavailable
 
 _RUNNER = Path(__file__).parent / "_sandbox_runner.py"
+
+log = logging.getLogger("cadio.engine")
+
+# Longest a request waits for a kernel slot before giving up with a "busy"
+# error. Previews queue briefly behind an in-flight build instead of piling on.
+_GATE_TIMEOUT_S = float(os.environ.get("CADIO_EXEC_GATE_TIMEOUT_S", "30"))
 
 PROGRAM_CONTRACT = """\
 A precision-engine program is a Python file using build123d (algebra mode) that defines:
@@ -99,6 +106,12 @@ class PrecisionEngine:
         self._pool_size = pool_size
         self._use_pool = use_pool
         self._pool_lock = threading.Lock()
+        # HARD ceiling on concurrent kernel processes — warm, cold, previews,
+        # affect builds, everything. Each OCCT process is ~360MB idle and can
+        # spike past 1GB on real geometry, so in a ~3GB container unbounded
+        # concurrency (e.g. a burst of slider previews on the cold path) is an
+        # OOM. The pool bounds its own workers, but the cold path had no limit.
+        self._exec_gate = threading.BoundedSemaphore(pool_size)
 
     def program_contract(self) -> str:
         return PROGRAM_CONTRACT
@@ -132,24 +145,48 @@ class PrecisionEngine:
             "coarse": coarse,
         }
 
-        raw: dict | None = None
-        if self._use_pool:
-            try:
-                raw = self._get_pool().run(request)
-            except WorkerError:
-                raw = None  # fall through to the cold path
+        if not self._exec_gate.acquire(timeout=_GATE_TIMEOUT_S):
+            return ExecutionResult(
+                ok=False, run_dir=run_dir,
+                error="the server is busy building other models — try again in a moment",
+                duration_s=round(time.perf_counter() - t0, 2),
+            )
+        try:
+            raw = self._execute_gated(program_path, params, run_dir, request)
+        finally:
+            self._exec_gate.release()
         if raw is None:
-            raw = self._run_cold(program_path, params, run_dir)
-            if raw is None:
-                return ExecutionResult(
-                    ok=False, run_dir=run_dir,
-                    error=f"execution failed or timed out after {self.timeout_s}s",
-                    duration_s=round(time.perf_counter() - t0, 2),
-                )
+            return ExecutionResult(
+                ok=False, run_dir=run_dir,
+                error=f"execution failed or timed out after {self.timeout_s}s",
+                duration_s=round(time.perf_counter() - t0, 2),
+            )
 
         result = self._postprocess(raw, run_dir, preview)
         result.duration_s = round(time.perf_counter() - t0, 2)  # honest wall clock the user waited
         return result
+
+    def _execute_gated(self, program_path: Path, params: dict[str, Any] | None,
+                       run_dir: Path, request: dict) -> dict | None:
+        """Run one job while holding an exec-gate slot. Fallback policy:
+        - pool unavailable (boot failure / saturation): cold path — the job is
+          not suspect, only the pool is.
+        - worker died or timed out RUNNING the job: NO cold re-run. The job is
+          the prime suspect (kernel crash / runaway geometry / OOM); repeating
+          it cold doubles the damage at the worst possible moment. The agent
+          gets an instructive error and writes a simpler program instead."""
+        if self._use_pool:
+            try:
+                return self._get_pool().run(request)
+            except WorkerJobError as exc:
+                log.warning("job killed/timed out its worker (no cold re-run): %s", exc)
+                return {"ok": False, "error": (
+                    "the program crashed or overwhelmed the geometry kernel "
+                    f"({exc}). Simplify it: fewer/cheaper boolean operations, "
+                    "fillet fewer edges at once, and reduce feature counts.")}
+            except WorkerUnavailable as exc:
+                log.warning("worker pool unavailable, falling back to cold path: %s", exc)
+        return self._run_cold(program_path, params, run_dir)
 
     def _get_pool(self) -> WorkerPool:
         with self._pool_lock:
@@ -200,7 +237,7 @@ class PrecisionEngine:
         ]
         artifacts = dict(raw["artifacts"])
 
-        validation, glb = self._validate_and_convert(
+        validation, glb, mesh = self._validate_and_convert(
             Path(artifacts["stl"]), raw, run_dir, make_glb=not preview
         )
         if glb:
@@ -232,12 +269,14 @@ class PrecisionEngine:
             except Exception:
                 pass  # the guard must never break a build
 
-        # renders are the agent's eyes + the project thumbnail — non-preview only
+        # renders are the agent's eyes + the project thumbnail — non-preview only.
+        # Reuse the validated mesh instead of re-reading the STL: one in-memory
+        # copy per build, not two (a detailed model's mesh is tens of MB).
         renders: dict[str, str] = {}
         if not preview:
             from ...render import render_views
 
-            renders = render_views(Path(artifacts["stl"]), run_dir)
+            renders = render_views(Path(artifacts["stl"]), run_dir, mesh=mesh)
 
         return ExecutionResult(
             ok=True,
@@ -253,7 +292,7 @@ class PrecisionEngine:
 
     def _validate_and_convert(
         self, stl_path: Path, raw: dict, run_dir: Path, make_glb: bool
-    ) -> tuple[ValidationReport, Path | None]:
+    ) -> tuple[ValidationReport, Path | None, Any]:
         report, mesh = validate_mesh(stl_path, expected_bbox_size=raw["bbox"]["size"])
         glb_path: Path | None = None
         if make_glb and mesh is not None:
@@ -262,4 +301,4 @@ class PrecisionEngine:
                 mesh.export(str(glb_path))
             except Exception:
                 glb_path = None
-        return report, glb_path
+        return report, glb_path, mesh

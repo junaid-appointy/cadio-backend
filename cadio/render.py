@@ -102,10 +102,13 @@ def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None
     fig.savefig(str(path), facecolor="#14171c", bbox_inches="tight", pad_inches=0)
 
 
-def render_views(stl_path: Path, out_dir: Path, size: int = _RENDER_SIZE) -> dict[str, str]:
+def render_views(stl_path: Path, out_dir: Path, size: int = _RENDER_SIZE,
+                 mesh=None) -> dict[str, str]:
     """Render the canonical views PLUS a cut-away section, so the agent can see
     interior features (walls, floors, bosses, cavities) it might have omitted.
     Returns {view_name: png_path}. Best-effort — returns {} on any failure.
+    Pass `mesh` (an already-loaded trimesh) to skip re-reading the STL — the
+    engine hands over the mesh it just validated so a build holds ONE copy.
 
     The mesh is decimated to a proxy first, because this sits on the build's
     critical path (it blocks the agent's turn) and matplotlib's 3D backend costs
@@ -115,7 +118,8 @@ def render_views(stl_path: Path, out_dir: Path, size: int = _RENDER_SIZE) -> dic
     try:
         import trimesh
 
-        mesh = trimesh.load(str(stl_path), force="mesh", process=False)
+        if mesh is None:
+            mesh = trimesh.load(str(stl_path), force="mesh", process=False)
         if mesh.faces is None or len(mesh.faces) == 0:
             return {}
 
