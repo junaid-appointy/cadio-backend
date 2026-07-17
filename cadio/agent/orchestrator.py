@@ -42,6 +42,70 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("CADIO_MAX_OUTPUT_TOKENS", "32000"))
 # How many times to re-prompt after a truncated, tool-less response before giving
 # up with a real message (never raw code) — guards against an infinite retry loop.
 MAX_TRUNCATION_RETRIES = 2
+# Builds allowed in ONE turn before the agent must stop and talk to the user.
+# A weak model that can't fix a validation error will otherwise rebuild forever
+# (observed: 9 invalid versions in a single request) while the user stares at
+# "building model…". Override with CADIO_MAX_BUILDS_PER_TURN.
+MAX_BUILDS_PER_TURN = int(os.environ.get("CADIO_MAX_BUILDS_PER_TURN", "5"))
+
+# validation code -> one plain sentence the USER sees in the live status line
+# while the agent reworks the model. Keep these human: no jargon, no traceback.
+_FRIENDLY_FAILURES = {
+    "not_watertight": "the model has gaps (parts only touching, not overlapping)",
+    "winding": "some surfaces came out inside-out",
+    "non_positive_volume": "the build produced no usable solid",
+    "empty_mesh": "the build produced no geometry",
+    "stl_unreadable": "the exported model couldn't be read back",
+    "bbox_mismatch": "the built size doesn't match the intended dimensions",
+}
+
+
+# validation code -> targeted corrective, injected into the tool result when the
+# SAME error fails twice in a row (the model is thrashing; give it the recipe).
+_ESCALATIONS = {
+    "not_watertight": (
+        "You have failed watertightness twice with the same approach. OVERLAP every "
+        "pair of joined solids by at least 0.2mm — never let solids merely touch at a "
+        "face, edge, or point. Check every Pos() offset against the neighbour's extent."),
+    "bbox_mismatch": (
+        "The measured bounding box disagreed with the BREP twice. A feature is "
+        "protruding outside the intended envelope, or a dimension is on the wrong "
+        "axis. Re-derive each feature's position from the parameters on paper first."),
+    "winding": (
+        "Surface orientation failed twice. Avoid mirror()/negative scaling; build the "
+        "mirrored part explicitly with its own positive geometry."),
+    "program_error": (
+        "The program errored twice. Fix ONLY the first error in the traceback; do not "
+        "restructure anything else."),
+}
+_SIMPLIFY = (
+    "STOP iterating on the full model — the same problem has now failed three times. "
+    "Rebuild the SIMPLEST possible core (the one primary solid, no features) and make "
+    "sure it validates clean. Then re-add features in SMALL batches, one build per "
+    "batch, so the first failing feature is obvious.")
+
+
+def _friendly_failure(result) -> str:
+    """One short, user-facing reason why a build attempt isn't good yet."""
+    if not result.ok:
+        err = (result.error or "").strip()
+        # asserts carry the agent's own requirement text — the most useful line
+        if "AssertionError" in err:
+            tail = err.rsplit("AssertionError", 1)[-1].strip(" :\n")
+            if tail:
+                return f"a requirement check failed: {tail.splitlines()[0][:120]}"
+        if "busy" in err:
+            return "the build queue is busy"
+        return "the program errored while building"
+    report = result.validation
+    if report and not report.ok:
+        for issue in report.issues:
+            if issue.severity == "error" and issue.code in _FRIENDLY_FAILURES:
+                return _FRIENDLY_FAILURES[issue.code]
+        for issue in report.issues:
+            if issue.severity == "error":
+                return issue.message[:120]
+    return "the result needs adjustments"
 
 TOOLS = [
     {
@@ -196,6 +260,10 @@ class Orchestrator:
         self.last_usage: dict[str, Any] | None = None  # token/cost/time of the last turn
         self._turn_renders: list[Path] = []  # renders from the current turn's builds
         self._stop = threading.Event()
+        self._turn_builds = 0                # run_cad calls in the current turn
+        self._last_failure_code: str | None = None  # for repeat-failure escalation
+        self._failure_streak = 0
+        self._budget_refusals = 0            # refusals issued after the budget spent
 
     def _supports_vision(self) -> bool:
         try:
@@ -260,8 +328,15 @@ class Orchestrator:
 
     def _run_program(self, code: str, params: dict | None, label: str) -> str:
         """Execute a build123d program, emit the run event, queue renders for
-        the agent's eyes, and return the measured facts as a JSON string."""
-        self._emit({"type": "status", "state": "running_cad", "label": label})
+        the agent's eyes, and return the measured facts as a JSON string.
+
+        Narrates the attempt over the status channel: which attempt this is
+        (n / budget) and, when a build isn't clean, a one-line human reason —
+        so the user watches progress instead of a silent multi-minute spinner."""
+        self._turn_builds += 1
+        n = self._turn_builds
+        self._emit({"type": "status", "state": "running_cad", "label": label,
+                    "attempt": n, "max_attempts": MAX_BUILDS_PER_TURN})
         run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         result = self.engine.execute(code, params, run_dir)
         self.last_run_dir = run_dir
@@ -269,6 +344,12 @@ class Orchestrator:
         self.last_program = code
         self._emit({"type": "run", "run_id": run_dir.name, "label": label,
                     "result": result.to_dict()})
+        clean = bool(result.ok and (result.validation is None or result.validation.ok))
+        if not clean:
+            self._emit({"type": "status", "state": "fixing", "attempt": n,
+                        "max_attempts": MAX_BUILDS_PER_TURN,
+                        "detail": _friendly_failure(result)})
+        self._track_failure(result, clean)
         if result.ok and result.renders:
             self._turn_renders = [Path(p) for p in result.renders.values()]
         payload = result.to_dict()
@@ -276,7 +357,47 @@ class Orchestrator:
         payload.pop("renders", None)
         if result.ok:
             payload["artifacts"] = sorted(result.artifacts)
+        payload["attempts_used"] = f"{n}/{MAX_BUILDS_PER_TURN}"
+        # repeat-failure escalation: same error twice -> the targeted recipe;
+        # three times -> force the simplify-and-stage strategy. Rides in the
+        # tool result so it lands exactly when the model plans its next build.
+        if self._failure_streak >= 3:
+            payload["guidance"] = _SIMPLIFY
+        elif self._failure_streak == 2:
+            payload["guidance"] = _ESCALATIONS.get(
+                self._last_failure_code or "",
+                "The same error failed twice — change approach, do not retry the "
+                "same fix a third time.")
         return json.dumps(payload)
+
+    def _track_failure(self, result, clean: bool) -> None:
+        """Maintain the consecutive-identical-failure streak for escalation."""
+        if clean:
+            self._last_failure_code, self._failure_streak = None, 0
+            return
+        code = "program_error"
+        if result.ok and result.validation and not result.validation.ok:
+            code = next((i.code for i in result.validation.issues if i.severity == "error"),
+                        "validation_error")
+        if code == self._last_failure_code:
+            self._failure_streak += 1
+        else:
+            self._last_failure_code, self._failure_streak = code, 1
+
+    def _over_budget(self) -> str | None:
+        """A refusal payload once the per-turn build budget is spent, else None.
+        The refusal instructs the model to wrap up honestly instead of building."""
+        if self._turn_builds < MAX_BUILDS_PER_TURN:
+            return None
+        self._budget_refusals += 1
+        return json.dumps({
+            "error": f"build budget for this turn is exhausted ({MAX_BUILDS_PER_TURN} builds)",
+            "instruction": (
+                "Do NOT build again this turn. Reply to the user now with: (1) what "
+                "you built and what state the latest version is in, (2) the one issue "
+                "you could not resolve, in plain words, and (3) a concrete suggestion "
+                "or question so THEY choose how to proceed. Be honest and brief."),
+        })
 
     def _handle_tool(self, name: str, tool_input: dict) -> str:
         if name == "ask_user":
@@ -286,9 +407,15 @@ class Orchestrator:
                 return json.dumps({"error": "geometry inspection unavailable"})
             return json.dumps(self.inspect_asset(tool_input.get("asset_id", "")))
         if name == "run_cad":
+            refusal = self._over_budget()
+            if refusal:
+                return refusal
             return self._run_program(
                 tool_input["code"], tool_input.get("params"), tool_input.get("label", ""))
         if name == "build_from_image":
+            refusal = self._over_budget()
+            if refusal:
+                return refusal
             if not self.trace_asset:
                 return json.dumps({"error": "image tracing unavailable"})
             traced = self.trace_asset(tool_input.get("asset_id", ""), {
@@ -324,6 +451,9 @@ class Orchestrator:
                                "image_asset_ids": [img["id"] for img in (images or [])]})
         self._turn_renders = []
         self._stop.clear()
+        self._turn_builds = 0
+        self._last_failure_code, self._failure_streak = None, 0
+        self._budget_refusals = 0
         # per-turn accounting: a turn may make several LLM calls (tool loop)
         t0 = time.monotonic()
         tin = tout = calls = 0
@@ -347,6 +477,18 @@ class Orchestrator:
                     self.last_usage = turn_usage()
                     self._emit({"type": "usage", "usage": self.last_usage})
                 return "⏹ Stopped."
+            # hard stop: budget spent AND the model ignored two refusals — end the
+            # turn ourselves rather than let it burn LLM calls asking to build.
+            if self._budget_refusals >= 2:
+                self.last_usage = turn_usage()
+                reply = ("I hit this turn's build limit without getting a clean "
+                         "result. The latest version is saved — tell me whether to "
+                         "keep refining it, simplify the design, or try a different "
+                         "approach, and I'll continue.")
+                self._persist("assistant", {"content": reply, "tool_calls": None,
+                                            "usage": self.last_usage})
+                self._emit({"type": "usage", "usage": self.last_usage})
+                return reply
             extra = {"api_key": self.api_key} if self.api_key else {}
             # push the model to reason harder about detailed multi-feature parts.
             # reasoning_effort is best-effort — drop_params silently removes it

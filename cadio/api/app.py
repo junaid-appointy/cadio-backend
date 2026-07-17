@@ -203,6 +203,13 @@ if not log.handlers:
 
 # ---- run payload shaping --------------------------------------------------
 
+def _run_valid(meta: dict) -> bool:
+    """True when the run built AND passed validation (a run can have ok=True
+    with a failed validation report — 'built but not clean')."""
+    v = meta.get("validation")
+    return bool(meta.get("ok")) and (not isinstance(v, dict) or bool(v.get("ok", True)))
+
+
 def _run_payload(pid: str, run: dict) -> dict:
     """Client-facing run meta: engine facts + computed artifact URLs."""
     meta = dict(run["meta"])
@@ -258,8 +265,11 @@ def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
     run = store.add_run(pid, run_id, label, bool(meta.get("ok")), meta, parent_run_id,
                         origin=origin)
     # precompute the parameter→affected-faces map in the background so clicking a
-    # parameter highlights instantly (see /affect endpoint for the lazy fallback)
-    if meta.get("ok") and meta.get("manifest"):
+    # parameter highlights instantly (see /affect endpoint for the lazy fallback).
+    # Only for CLEAN runs: an invalid attempt is usually superseded seconds later
+    # by the agent's next fix, so rebuilding it once per parameter just burns the
+    # worker pool the interactive turn needs.
+    if meta.get("ok") and meta.get("manifest") and _run_valid(meta):
         run_dir = config.project_runs_dir(pid) / run_id
         _ensure_precompute(run_dir, result_dict.get("params", {}), result_dict.get("manifest", []))
     # mirror the run's artifacts to R2 (durable copy; local disk stays a cache).
@@ -397,8 +407,8 @@ def run_affect(pid: str, run_id: str, user: dict = Depends(get_current_user)):
         except (json.JSONDecodeError, OSError):
             pass
     meta = run["meta"]
-    if not meta.get("ok") or not (run_dir / "program.py").exists():
-        return {}  # nothing to build — a genuinely empty map
+    if not _run_valid(meta) or not (run_dir / "program.py").exists():
+        return {}  # invalid/failed run: no affect map, and never rebuild it per-param
     _ensure_precompute(run_dir, meta.get("params", {}), meta.get("manifest", []))
     return JSONResponse({}, status_code=202)  # building — client should retry
 

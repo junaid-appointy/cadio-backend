@@ -80,6 +80,32 @@ superseded by Track A.
 
 ## Build log
 
+**2026-07-17 — build UX overhaul: narration, budgets, staged building.**
+Response to real-user pain (castle: 3 invalid versions + a stuck viewer;
+streamdeck case on a weak model: 9 invalid versions with a silent spinner):
+- **Live narration** (`orchestrator.py` → WS `status` events): every build
+  carries `attempt n/max`; a failed attempt emits `state:"fixing"` with a
+  plain-language reason (`_FRIENDLY_FAILURES`) — the user watches "attempt 2
+  needs fixes — the model has gaps · reworking…" instead of a dead spinner.
+- **Build budget** (`CADIO_MAX_BUILDS_PER_TURN`, default 5): at the cap the
+  agent is refused further builds and instructed to wrap up honestly; two
+  ignored refusals hard-stop the turn with a canned honest reply.
+- **Repeat-failure escalation**: the same validation code failing 2× injects a
+  targeted corrective into the tool result; 3× forces simplify-and-stage.
+- **Staged building** (corpus): complex models (>3 parts) must build massing
+  first (validated), then features in 2–4-item batches — user sees the shape
+  in seconds and weak models handle small deltas (the Gemini-Flash fix).
+- **Viewer honesty** (`Viewer.tsx`): the silent `.catch(() => {})` that caused
+  the infinite "Loading model…" is now an error card with Retry + a 45s stall
+  timeout + a download % readout.
+- **Size-relative STL tolerance** (`_sandbox_runner.py`): chord tolerance
+  0.02–0.15mm scaled by model diagonal instead of fixed 1e-3 — castle-class
+  test went to 0.6MB/11.6k tris; export/validate/render/download all shrink.
+- **No affect precompute for invalid runs** (`app.py _run_valid`), and the
+  `/affect` endpoint no longer re-queues rebuilds of invalid runs.
+- **Chat**: consecutive invalid builds collapse into one "N attempts needed
+  rework" chip (expandable) instead of a wall of red Invalid cards.
+
 **2026-07-06 — parameter → affected-geometry highlighting.** Click a parameter
 in the Params panel and the faces it controls glow cyan in the viewer.
 Mechanism (`cadio/affect.py`): there's no stored param→face mapping (the number

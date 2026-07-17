@@ -827,18 +827,27 @@ def run_job(program: str, outdir: str, params: dict | None = None, preview: bool
 
         artifacts = {}
         stl_path = out / "model.stl"
+        bb0 = part.bounding_box()
+        diag = ((bb0.size.X ** 2 + bb0.size.Y ** 2 + bb0.size.Z ** 2) ** 0.5) or 1.0
         if coarse:
             # throwaway diff build (affect map): tessellate coarsely — a fraction
             # of the triangles, so both STL export and the downstream proximity
             # diff are far cheaper. Tolerance scales with size and stays well below
             # the affect threshold (max(0.15, 0.0025*diag)) so it adds no false
             # "moved" faces.
-            bb0 = part.bounding_box()
-            diag = ((bb0.size.X ** 2 + bb0.size.Y ** 2 + bb0.size.Z ** 2) ** 0.5) or 1.0
             tol = max(0.05, 0.0008 * diag)
             export_stl(part, str(stl_path), tolerance=tol, angular_tolerance=0.5)
         else:
-            export_stl(part, str(stl_path))
+            # size-relative chord tolerance instead of build123d's fixed 1e-3mm.
+            # 1e-3 on a large model (a castle) tessellates to hundreds of
+            # thousands of triangles — tens of MB of STL that the browser must
+            # download and decode (the "model stuck loading" complaint), plus
+            # slower export/validation/render on every attempt. 0.02–0.15mm
+            # chord deviation is invisible on screen and beyond print
+            # resolution; every downstream stage keys off THIS mesh (pick maps,
+            # affect maps, viewer indices), so consistency is preserved.
+            tol = min(0.15, max(0.02, 0.00025 * diag))
+            export_stl(part, str(stl_path), tolerance=tol)
         artifacts["stl"] = str(stl_path)
         if not preview:  # STEP is for final exports; skip on live previews
             step_path = out / "model.step"

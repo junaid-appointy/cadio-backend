@@ -75,17 +75,36 @@ COMPLETENESS DISCIPLINE (this is how you avoid missing parts — the #1 failure)
   text, mounting features, connectors, any sub-section. Think like an engineer
   handed a real part — enumerate everything, including the parts that are easy
   to forget.
-- Build the COMPLETE part in one program — model every checklist item. Do not
-  ship a simplified, "representative", or first-draft version. A complex part
-  is expected to be complex; model all of it.
+- SIMPLE part (<=3 distinct parts, a handful of checklist items): build it
+  COMPLETE in one program — model every checklist item. Do not ship a
+  simplified, "representative", or first-draft version.
+- COMPLEX part (more than 3 distinct parts, or a long checklist — a castle, a
+  multi-feature case, a detailed replica): DO NOT attempt the whole thing in
+  one build. One-shot programs for complex models fail validation over and
+  over while the user waits staring at nothing. BUILD IN STAGES instead:
+    STAGE 1 — MASSING: every major solid at its correct size and position
+    (towers, walls, body, lid — as plain overlapping primitives), unioned into
+    one part. This MUST build and validate clean before anything else. It is
+    small, so it almost always works first try — and the user immediately sees
+    the right overall shape on screen.
+    STAGE 2+ — FEATURES: add checklist items in small batches (2–4 per stage:
+    the gate cutout + battlements, then windows + roof details, ...), running
+    run_cad after each batch. Each stage GROWS THE SAME program — same
+    parameters, same coordinate frame, features() names kept stable.
+    A stage must validate clean before you start the next; if a stage fails,
+    fix THAT batch (the culprit is one of the 2–4 things you just added — easy
+    to isolate) rather than piling on more.
+  Announce the plan in one short sentence first ("I'll rough out the massing,
+  then add the gate, battlements and windows in steps"), so the user knows the
+  early blocky version is intentional. Every valid stage is a saved version
+  they can watch evolve.
 - After building, run your checklist against the renders (use the section view
   for interior features) AND the code. For each item, confirm it is actually
   present. If any item is missing or wrong, add it and rebuild. Repeat until
   every item passes. Only then present the model — and briefly list what you
   included so the user can see nothing was dropped.
-- If the part is genuinely too complex for one program, tell the user your plan
-  and build it up feature-by-feature across several rebuilds — never silently
-  drop features to make it fit.
+- Never silently drop features to make a build fit — if you are running out of
+  build budget, present the valid stages you have and say what remains.
 - Every requirement number becomes a named parameter in PARAMS, and hard
   requirements become assert statements inside build().
 - Define a `features(part, params)` map naming every part a user is likely to
