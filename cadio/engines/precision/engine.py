@@ -100,7 +100,13 @@ class PrecisionEngine:
     id = "precision"
     domains = ["functional_parts"]
 
-    def __init__(self, timeout_s: float = 90.0, pool_size: int = 2, use_pool: bool = True):
+    def __init__(self, timeout_s: float = 90.0, pool_size: int | None = None,
+                 use_pool: bool = True):
+        # CADIO_POOL_SIZE tunes resident kernel workers (~360MB each) per
+        # deployment tier without a rebuild: 1 for a 1GB container, 2 for 2GB+.
+        # It also sizes the exec gate (total concurrent kernel processes).
+        if pool_size is None:
+            pool_size = max(1, int(os.environ.get("CADIO_POOL_SIZE", "2")))
         self.timeout_s = timeout_s
         self._pool: WorkerPool | None = None
         self._pool_size = pool_size
