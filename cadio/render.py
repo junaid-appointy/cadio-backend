@@ -39,6 +39,14 @@ _RENDER_MAX_FACES = int(os.environ.get("CADIO_RENDER_MAX_FACES", "18000"))
 _RENDER_SIZE = 512
 
 
+def decimate_to(mesh, max_faces: int):
+    """Public: coarsen a trimesh to <= max_faces triangles (best-effort; returns
+    the input unchanged if already small or if simplification is unavailable).
+    The engine uses this to bound the mesh handed to GLB + rendering so a huge
+    model can't OOM the main process on a memory-tight pod."""
+    return _decimate(mesh, max_faces)
+
+
 def _decimate(mesh, max_faces: int):
     """Reduce the mesh to at most `max_faces` triangles for rendering. Returns the
     original when it's already small enough or if simplification is unavailable."""

@@ -102,6 +102,43 @@ def low_cpu_pod() -> bool:
     return cpus is not None and cpus < _LOW_CPU_THRESHOLD
 
 
+def generous_pod() -> bool:
+    """True when the pod has real headroom — used to scale quality/throughput UP
+    (more builds per turn, finer renders) instead of the survive-first defaults a
+    small pod gets. A dev laptop (no cgroup limits) counts as generous."""
+    limit, cpus = cgroup_mem_limit_mb(), cgroup_cpus()
+    if limit is None and cpus is None:
+        return True  # unconstrained dev box
+    return (limit or 0) >= 3584 and (cpus or 0) >= 1.25
+
+
+# Facet ceiling the MAIN process fully serializes to GLB / holds for rendering.
+# GLB and the agent renders are DISPOSABLE derivatives (the viewer draws from
+# model.stl, which — with STEP and the pick facemap — always stays full-res); a
+# very detailed model's full mesh + GLB buffer + render copies held at once can
+# exceed the cgroup and OOM-kill the pod. Over this cap the derivatives are built
+# from a decimated proxy and the full mesh is freed first. The cap scales with
+# the pod's RAM, so a bigger pod keeps full detail. None outside a limited cgroup.
+_MAIN_MESH_FACETS_PER_MB = int(os.environ.get("CADIO_MAIN_MESH_FACETS_PER_MB", "800"))
+_MAIN_MESH_API_RESERVE_MB = 220          # API process baseline
+_MAIN_MESH_WORKER_RESERVE_MB = 700       # a resident (post-build) kernel worker
+
+
+def main_mesh_facet_cap(pool_size: int = 1) -> int | None:
+    """Max facets the main process will fully process before it must decimate the
+    GLB/render mesh. Derived from the cgroup RAM left after the API base and the
+    resident workers, or CADIO_MAIN_MESH_CAP to override. None on a dev box."""
+    override = os.environ.get("CADIO_MAIN_MESH_CAP")
+    if override is not None:
+        return max(50_000, int(override))
+    limit = cgroup_mem_limit_mb()
+    if limit is None:
+        return None  # unconstrained: never decimate for memory
+    headroom_mb = max(128, limit - _MAIN_MESH_API_RESERVE_MB
+                      - _MAIN_MESH_WORKER_RESERVE_MB * max(1, pool_size))
+    return max(150_000, headroom_mb * _MAIN_MESH_FACETS_PER_MB)
+
+
 _mem_pct_cache: tuple[float, float | None] = (0.0, None)
 _mem_pct_lock = threading.Lock()
 
@@ -492,12 +529,40 @@ class PrecisionEngine:
         artifacts = dict(raw["artifacts"])
 
         t = time.perf_counter()
-        validation, glb, mesh = self._validate_and_convert(
-            Path(artifacts["stl"]), raw, run_dir, make_glb=not preview
+        # validate loads the full mesh; GLB is built below from a memory-bounded
+        # copy (make_glb=False here) so the full mesh + GLB buffer are never held
+        # at once on a tight pod.
+        validation, _, mesh = self._validate_and_convert(
+            Path(artifacts["stl"]), raw, run_dir, make_glb=False
         )
+        # Memory guard (the OOM-on-a-detailed-model fix): over the pod's facet cap,
+        # build GLB + renders from a decimated proxy and free the full mesh first.
+        # model.stl / STEP / facemap stay full-res, so quality, parameters and pick
+        # accuracy are untouched — only the exported GLB and the agent's render
+        # "eyes" coarsen, and only on a pod too small to hold the full mesh.
+        render_mesh, bounded = mesh, False
+        if mesh is not None and not preview:
+            cap = main_mesh_facet_cap(self._pool_size)
+            if cap is not None and len(mesh.faces) > cap:
+                try:
+                    from ...render import decimate_to
+
+                    render_mesh = decimate_to(mesh, cap)
+                    bounded = len(render_mesh.faces) < len(mesh.faces)
+                    log.info("mesh %d facets > cap %d — GLB/renders use a %d-facet "
+                             "proxy (pod RAM guard)", len(mesh.faces), cap,
+                             len(render_mesh.faces))
+                except Exception:
+                    render_mesh = mesh  # best-effort: fall back to the full mesh
+                mesh = None  # drop the full-mesh reference before GLB/render
+        if not preview and render_mesh is not None:
+            try:
+                glb_path = run_dir / "model.glb"
+                render_mesh.export(str(glb_path))
+                artifacts["glb"] = str(glb_path)
+            except Exception:
+                pass
         timings["validate_glb_s"] = round(time.perf_counter() - t, 3)
-        if glb:
-            artifacts["glb"] = str(glb)
 
         if not preview:
             # precompress the STL once (final runs only) so downloads serve the
@@ -552,8 +617,12 @@ class PrecisionEngine:
             from ...render import render_views
 
             t = time.perf_counter()
-            only = ["iso"] if renders_mode == "thumbnail" else None
-            renders = render_views(Path(artifacts["stl"]), run_dir, mesh=mesh, only=only)
+            # spec-adaptive eyes: a mesh so big it had to be bounded on a tight pod
+            # gets the single iso view instead of the full 5-view set — one good
+            # eye beats risking the pod. A bigger pod never bounds, so it keeps the
+            # full set. render_mesh is the (proxy or full) mesh already in hand.
+            only = ["iso"] if (renders_mode == "thumbnail" or bounded) else None
+            renders = render_views(Path(artifacts["stl"]), run_dir, mesh=render_mesh, only=only)
             timings["render_s"] = round(time.perf_counter() - t, 3)
 
         return ExecutionResult(

@@ -49,8 +49,15 @@ MAX_TRUNCATION_RETRIES = 2
 # talk to the user. Only builds that produce clean geometry count — a complex
 # model is built in stages (massing, then feature batches; see corpus.py), and a
 # too-low budget delivered a coarse, under-parameterized model because it was
-# spent before the agent finished staging. Override with CADIO_MAX_BUILDS_PER_TURN.
-MAX_BUILDS_PER_TURN = int(os.environ.get("CADIO_MAX_BUILDS_PER_TURN", "8"))
+# spent before the agent finished staging. Scales with the pod: a small box gets
+# a survive-first 8; a roomy box gets more refinement (better quality). Override
+# with CADIO_MAX_BUILDS_PER_TURN.
+try:
+    from ..engines.precision.engine import generous_pod as _generous_pod
+    _BUDGET_DEFAULT = "12" if _generous_pod() else "8"
+except Exception:
+    _BUDGET_DEFAULT = "8"
+MAX_BUILDS_PER_TURN = int(os.environ.get("CADIO_MAX_BUILDS_PER_TURN", _BUDGET_DEFAULT))
 # Hard ceiling on TOTAL run_cad attempts in a turn (clean + failed). Separate
 # from the productive budget so a failing/timing-out build on a slow box can't
 # starve the refinement loop (each failure used to burn the productive budget),

@@ -159,6 +159,40 @@ Fixes:
    `CADIO_POOL_SIZE=1` matches workers to cores. Or move to `extra_heavy` for
    more CPU (read the actual grant from `/healthz` after; see tier table above).
 
+## OOM on a detailed model: bound the disposable derivatives (2026-07-18)
+
+Symptom: asking the agent for a very detailed model (a "Valorant Operator" — a
+sniper rifle: scope, barrel, stock, magazine, rails) crashed the backend after a
+few iterations. `/healthz` afterward showed a fresh pod (`peak_mb` reset, low
+`rss_peak_mb`, `workers: []`) — a cgroup **OOM kill → auto-restart**, which drops
+every WebSocket ("the backend crashed").
+
+Root cause: the per-worker `RLIMIT_DATA` bounds the **worker**, but the worker
+only exports the STL. Everything after runs in the **main API process** and loads
+the full mesh: `validate_mesh`, **GLB export**, and the 5-view matplotlib render.
+The main build STL has no facet cap, so a detailed model produces a huge mesh;
+holding the full mesh + the GLB buffer + render copies at once on a 2GB pod
+exceeds the cgroup. The raised build budget compounds it — the agent keeps adding
+detail across more staging passes until the mesh is big enough to OOM.
+
+Fix — **spec-adaptive bounding of the disposable derivatives** (the same
+"small pod survives, big pod scales up" principle as the CPU self-tuning):
+- GLB and agent renders are throwaway (the viewer draws from `model.stl`, which
+  with STEP and the pick facemap always stays full-res). Over a memory-derived
+  facet cap (`main_mesh_facet_cap()` = RAM left after API base + resident workers
+  × `CADIO_MAIN_MESH_FACETS_PER_MB`, or `CADIO_MAIN_MESH_CAP`), GLB + renders are
+  built from a **decimated proxy** and the **full mesh is freed first** — so the
+  full mesh and the GLB buffer are never held together. Model quality, parameters
+  and pick accuracy are untouched; only the exported GLB and the agent's render
+  eyes coarsen, and only on a pod too small to hold the mesh.
+- A bounded (huge) mesh also drops to the **single iso render** instead of the
+  5-view set. A bigger pod never bounds → full detail + full eyes.
+- The build budget itself scales: `generous_pod()` (≥3584MB and ≥1.25 CPU, or a
+  dev box) gets `MAX_BUILDS_PER_TURN` 12, a small pod gets 8.
+
+Measured caps: 2048MB/1-worker → ~900K facets; 4096MB/2-worker → ~2M. So on the
+current 2GB pod a model over ~900K facets degrades gracefully instead of crashing.
+
 ## Deploying on Bifrost (read before pushing cadio-backend)
 
 Flow: this repo (`cadio.git`) is the source of truth; the backend subset is
@@ -247,6 +281,10 @@ Bifrost; the script is the workaround until then.
 | `CADIO_AFFECT_MEM_PCT` | 70 | affect sweeps don't even start above this |
 | `CADIO_AFFECT_PRECOMPUTE` | 1 | `0` disables background affect sweeps (lazy `/affect` still serves on click) — set on sub-1-CPU pods |
 | `CADIO_AFFECT_MAX_FAILS` | 3 | consecutive failed per-param builds before a sweep aborts (crash-loop guard) |
+| `CADIO_MAX_BUILDS_PER_TURN` | 8 / 12 | clean builds/turn (8 on a small pod, 12 on a generous one) before the agent must wrap up |
+| `CADIO_MAX_BUILD_ATTEMPTS` | 2× budget | hard ceiling on total run_cad attempts (clean+failed) — stops a runaway failing turn |
+| `CADIO_MAIN_MESH_CAP` | RAM-derived | facets above which GLB/renders use a decimated proxy + the full mesh is freed (OOM guard); default scales with cgroup RAM |
+| `CADIO_MAIN_MESH_FACETS_PER_MB` | 800 | facets-per-MB constant behind the derived cap |
 | `CADIO_RENDER_MAX_FACES` | 18000 | render-proxy decimation (A/B 8000 before lowering fleet-wide) |
 | `CADIO_PREVIEW_GATE_TIMEOUT_S` | 4 | preview fast-fail (503 + Retry-After, client retries latest value) |
 | `CADIO_MAX_QUEUE_DEPTH` | 6 | queued interactive builds before global shed |
