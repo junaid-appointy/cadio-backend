@@ -19,6 +19,7 @@ timeout. TODO(P1): no-network Docker with resource limits (plan §6.3).
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -27,11 +28,11 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..base import ExecutionResult, ParamSpec, ValidationReport
 from ...validation.mesh import validate_mesh
-from .pool import WorkerJobError, WorkerPool, WorkerUnavailable
+from .pool import WorkerJobError, WorkerPool, WorkerUnavailable, memory_limit_preexec
 
 _RUNNER = Path(__file__).parent / "_sandbox_runner.py"
 
@@ -40,6 +41,131 @@ log = logging.getLogger("cadio.engine")
 # Longest a request waits for a kernel slot before giving up with a "busy"
 # error. Previews queue briefly behind an in-flight build instead of piling on.
 _GATE_TIMEOUT_S = float(os.environ.get("CADIO_EXEC_GATE_TIMEOUT_S", "30"))
+
+# Above this cgroup memory usage, a SECOND concurrent kernel job is admitted
+# only if it's interactive (agent build / user action). Background (affect) and
+# preview jobs yield — they are recomputable and stale-able respectively.
+_MEM_PRESSURE_PCT = float(os.environ.get("CADIO_MEM_PRESSURE_PCT", "80"))
+
+# Below this cgroup limit the pod cannot host even one kernel worker
+# (boot ~220MB + worker ~360MB). Seen during the deploy size-flip window
+# (a 512MB pod serving while the heavy pod terminates) — refuse builds
+# honestly instead of OOM-dying mid-boot.
+_MIN_BUILD_MEM_MB = int(os.environ.get("CADIO_MIN_BUILD_MEM_MB", "1024"))
+
+# error text the affect loop keys off to skip-and-let-the-lazy-path-retry
+MEM_PRESSURE_ERROR = "deferred: the server is under memory pressure"
+
+_CGROUP = Path("/sys/fs/cgroup")
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        text = path.read_text().strip()
+        return None if text == "max" else int(text)
+    except Exception:
+        return None
+
+
+def cgroup_mem_limit_mb() -> int | None:
+    """The pod's cgroup-v2 memory limit in MB (None outside a limited cgroup)."""
+    limit = _read_int(_CGROUP / "memory.max")
+    return None if limit is None else limit // (1024 * 1024)
+
+
+_mem_pct_cache: tuple[float, float | None] = (0.0, None)
+_mem_pct_lock = threading.Lock()
+
+
+def cgroup_mem_pct() -> float | None:
+    """Current cgroup memory usage as % of the limit, cached 250ms (it's read
+    on every kernel-job admission). None when not in a limited cgroup (dev)."""
+    global _mem_pct_cache
+    now = time.monotonic()
+    with _mem_pct_lock:
+        ts, val = _mem_pct_cache
+        if now - ts < 0.25:
+            return val
+        current = _read_int(_CGROUP / "memory.current")
+        limit = _read_int(_CGROUP / "memory.max")
+        if current and limit:
+            # memory.current counts reclaimable page cache (every artifact
+            # write inflates it); subtract inactive_file so the gate reacts to
+            # the working set — the number the OOM killer actually acts on —
+            # not to cache the kernel would happily drop.
+            try:
+                for line in (_CGROUP / "memory.stat").read_text().splitlines():
+                    if line.startswith("inactive_file "):
+                        current = max(0, current - int(line.split(" ", 1)[1]))
+                        break
+            except Exception:
+                pass
+        val = None if not current or not limit else round(100.0 * current / limit, 1)
+        _mem_pct_cache = (now, val)
+        return val
+
+
+class _PriorityGate:
+    """Counted gate over kernel slots where interactive callers always beat
+    background ones. Replaces the plain BoundedSemaphore so an affect-map
+    sweep can never delay a human: background waiters acquire only when no
+    interactive caller is queued. FIFO within each class; `on_wait` reports
+    the caller's live queue position (number of jobs ahead) for honest UI."""
+
+    def __init__(self, size: int):
+        self._size = size
+        self._cond = threading.Condition()
+        self._in_flight = 0
+        self._seq = itertools.count()
+        self._queues: dict[int, list[int]] = {0: [], 1: []}  # 0=interactive, 1=background
+
+    def acquire(self, priority: int = 0, timeout: float | None = None,
+                on_wait: Callable[[int], None] | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        ticket = next(self._seq)
+        q = self._queues[priority]
+        with self._cond:
+            q.append(ticket)
+            last_reported = None
+            try:
+                while True:
+                    ahead = q.index(ticket) + (len(self._queues[0]) if priority else 0)
+                    if ahead == 0 and self._in_flight < self._size:
+                        q.remove(ticket)
+                        self._in_flight += 1
+                        return True
+                    if on_wait is not None and ahead != last_reported:
+                        last_reported = ahead
+                        try:
+                            on_wait(ahead)  # must be fast/non-blocking (called under the gate lock)
+                        except Exception:
+                            pass
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        q.remove(ticket)
+                        self._cond.notify_all()  # our departure may unblock a background waiter
+                        return False
+                    self._cond.wait(remaining)
+            except BaseException:
+                if ticket in q:
+                    q.remove(ticket)
+                self._cond.notify_all()
+                raise
+
+    def release(self) -> None:
+        with self._cond:
+            if self._in_flight <= 0:
+                raise ValueError("gate released more times than acquired")
+            self._in_flight -= 1
+            self._cond.notify_all()
+
+    def depth(self) -> dict[str, int]:
+        with self._cond:
+            return {
+                "in_flight": self._in_flight,
+                "waiting_interactive": len(self._queues[0]),
+                "waiting_background": len(self._queues[1]),
+            }
 
 PROGRAM_CONTRACT = """\
 A precision-engine program is a Python file using build123d (algebra mode) that defines:
@@ -112,12 +238,21 @@ class PrecisionEngine:
         self._pool_size = pool_size
         self._use_pool = use_pool
         self._pool_lock = threading.Lock()
+        # Constrained mode: the deploy size-flip parks a 512MB pod in front of
+        # users for a minute; it can serve chat/metadata but a single kernel
+        # worker would OOM it. Refuse builds honestly and never boot the pool.
+        limit = cgroup_mem_limit_mb()
+        self.constrained = limit is not None and limit < _MIN_BUILD_MEM_MB
+        if self.constrained:
+            log.warning("cgroup limit %sMB < %sMB — builds disabled (constrained mode)",
+                        limit, _MIN_BUILD_MEM_MB)
         # HARD ceiling on concurrent kernel processes — warm, cold, previews,
         # affect builds, everything. Each OCCT process is ~360MB idle and can
         # spike past 1GB on real geometry, so in a ~3GB container unbounded
         # concurrency (e.g. a burst of slider previews on the cold path) is an
         # OOM. The pool bounds its own workers, but the cold path had no limit.
-        self._exec_gate = threading.BoundedSemaphore(pool_size)
+        # Interactive callers always outrank background (affect) ones.
+        self._exec_gate = _PriorityGate(pool_size)
 
     def program_contract(self) -> str:
         return PROGRAM_CONTRACT
@@ -131,12 +266,23 @@ class PrecisionEngine:
         run_dir: Path,
         preview: bool = False,
         coarse: bool = False,
+        renders: str = "full",  # "full" | "thumbnail" | "none" — see _postprocess
+        priority: int = 0,  # 0 = interactive (human waiting), 1 = background (affect)
+        gate_timeout_s: float | None = None,
+        on_wait: Callable[[int], None] | None = None,  # live queue position (jobs ahead)
     ) -> ExecutionResult:
         # absolute: subprocesses run with cwd inside the sandbox, so relative
         # paths would resolve inside themselves
         t0 = time.perf_counter()
         run_dir = Path(run_dir).resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.constrained:
+            return ExecutionResult(
+                ok=False, run_dir=run_dir,
+                error="the server is mid-deploy and can't build right now — builds resume in a minute",
+            )
+
         program_path = run_dir / "program.py"
         program_path.write_text(code)
 
@@ -149,15 +295,51 @@ class PrecisionEngine:
             # maps), where a fine mesh is wasted: far fewer triangles to export
             # and to run proximity queries against.
             "coarse": coarse,
+            # niced by the pool so a background kernel job yields CPU to a
+            # concurrent interactive one (matters at 1.5 shared cores)
+            "_background": priority > 0,
         }
 
-        if not self._exec_gate.acquire(timeout=_GATE_TIMEOUT_S):
+        timeout = _GATE_TIMEOUT_S if gate_timeout_s is None else gate_timeout_s
+        if not self._exec_gate.acquire(priority=priority, timeout=timeout, on_wait=on_wait):
             return ExecutionResult(
                 ok=False, run_dir=run_dir,
                 error="the server is busy building other models — try again in a moment",
                 duration_s=round(time.perf_counter() - t0, 2),
             )
+        gate_wait_s = round(time.perf_counter() - t0, 3)
         try:
+            # Pressure admission: with another kernel job already in flight and
+            # cgroup memory high, don't stack a second geometry spike on it.
+            # Background/preview jobs shed immediately (recomputable / stale
+            # anyway). An INTERACTIVE build instead WAITS its turn: the one
+            # thing the per-worker rlimit cannot save the pod from is two
+            # near-cap workers at once (2 × ~1.3GB + the API process exceeds a
+            # 2GB cgroup) — under pressure the box degrades to single-build
+            # throughput instead of gambling the pod.
+            pct = cgroup_mem_pct()
+            if (pct is not None and pct > _MEM_PRESSURE_PCT
+                    and self._exec_gate.depth()["in_flight"] > 1):
+                if priority > 0 or preview:
+                    return ExecutionResult(
+                        ok=False, run_dir=run_dir,
+                        error=MEM_PRESSURE_ERROR,
+                        duration_s=round(time.perf_counter() - t0, 2),
+                    )
+                deadline = time.monotonic() + self.timeout_s
+                while time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    pct = cgroup_mem_pct()
+                    if pct is None or pct <= _MEM_PRESSURE_PCT:
+                        break
+                    if self._exec_gate.depth()["in_flight"] <= 1:
+                        break  # the other job finished; its memory is freed/freeing
+                else:
+                    return ExecutionResult(
+                        ok=False, run_dir=run_dir,
+                        error="the server is busy building other models — try again in a moment",
+                        duration_s=round(time.perf_counter() - t0, 2),
+                    )
             raw = self._execute_gated(program_path, params, run_dir, request)
         finally:
             self._exec_gate.release()
@@ -168,7 +350,8 @@ class PrecisionEngine:
                 duration_s=round(time.perf_counter() - t0, 2),
             )
 
-        result = self._postprocess(raw, run_dir, preview)
+        result = self._postprocess(raw, run_dir, preview, renders)
+        result.timings["gate_wait_s"] = gate_wait_s
         result.duration_s = round(time.perf_counter() - t0, 2)  # honest wall clock the user waited
         return result
 
@@ -209,6 +392,29 @@ class PrecisionEngine:
                 self._pool.shutdown()
                 self._pool = None
 
+    def gate_depth(self) -> dict[str, int]:
+        """Cheap, lock-light queue snapshot for admission control."""
+        return self._exec_gate.depth()
+
+    def stats(self) -> dict[str, Any]:
+        """Live engine numbers for /healthz — what you watch to run this box
+        near capacity: gate depth (queueing), per-worker RSS (recycle health).
+        Never blocks: _pool_lock is held for the WHOLE first-worker boot in
+        _get_pool, and a liveness probe must not hang behind it."""
+        if not self._pool_lock.acquire(timeout=0.2):
+            return {"constrained": self.constrained, "pool_size": self._pool_size,
+                    "gate": self._exec_gate.depth(), "workers": "booting"}
+        try:
+            pool = self._pool
+        finally:
+            self._pool_lock.release()
+        return {
+            "constrained": self.constrained,
+            "pool_size": self._pool_size,
+            "gate": self._exec_gate.depth(),
+            "workers": pool.stats() if pool is not None else [],
+        }
+
     def _run_cold(
         self, program_path: Path, params: dict[str, Any] | None, run_dir: Path
     ) -> dict | None:
@@ -223,6 +429,7 @@ class PrecisionEngine:
             proc = subprocess.run(
                 [sys.executable, "-I", str(_RUNNER), str(program_path), str(params_path), str(run_dir)],
                 capture_output=True, text=True, timeout=self.timeout_s, env=env, cwd=run_dir,
+                preexec_fn=memory_limit_preexec(),  # same rlimit as pool workers
             )
         except subprocess.TimeoutExpired:
             return None
@@ -233,9 +440,14 @@ class PrecisionEngine:
 
     # ---- post-processing ---------------------------------------------------
 
-    def _postprocess(self, raw: dict, run_dir: Path, preview: bool) -> ExecutionResult:
+    def _postprocess(self, raw: dict, run_dir: Path, preview: bool,
+                     renders_mode: str = "full") -> ExecutionResult:
+        timings: dict[str, float] = dict(raw.get("timings") or {})
+        rss_peak = raw.get("rss_peak_mb")
         if not raw.get("ok"):
-            return ExecutionResult(ok=False, run_dir=run_dir, error=raw.get("error", "unknown error"))
+            return ExecutionResult(ok=False, run_dir=run_dir,
+                                   error=raw.get("error", "unknown error"),
+                                   timings=timings, rss_peak_mb=rss_peak)
 
         manifest = [
             ParamSpec(**{k: v for k, v in spec.items() if k in ParamSpec.__dataclass_fields__})
@@ -243,11 +455,28 @@ class PrecisionEngine:
         ]
         artifacts = dict(raw["artifacts"])
 
+        t = time.perf_counter()
         validation, glb, mesh = self._validate_and_convert(
             Path(artifacts["stl"]), raw, run_dir, make_glb=not preview
         )
+        timings["validate_glb_s"] = round(time.perf_counter() - t, 3)
         if glb:
             artifacts["glb"] = str(glb)
+
+        if not preview:
+            # precompress the STL once (final runs only) so downloads serve the
+            # .gz with zero request CPU and an honest Content-Length — replaces
+            # per-download middleware gzip of megabytes of mesh. Best-effort.
+            try:
+                import gzip
+
+                stl = Path(artifacts["stl"])
+                t = time.perf_counter()
+                (stl.parent / (stl.name + ".gz")).write_bytes(
+                    gzip.compress(stl.read_bytes(), compresslevel=6))
+                timings["stl_gz_s"] = round(time.perf_counter() - t, 3)
+            except Exception:
+                pass
 
         # naming-quality warnings from the sandbox part table (lazy/under-naming).
         # They're warnings, not errors — they don't flip validation.ok, but they
@@ -278,11 +507,18 @@ class PrecisionEngine:
         # renders are the agent's eyes + the project thumbnail — non-preview only.
         # Reuse the validated mesh instead of re-reading the STL: one in-memory
         # copy per build, not two (a detailed model's mesh is tens of MB).
+        # renders_mode picks how many eyes: "full" (all views + section, for a
+        # vision model that will actually look), "thumbnail" (iso only — keeps
+        # the project thumbnail without paying ~5 matplotlib renders when no
+        # vision model is attached / on manual Code-tab runs), "none".
         renders: dict[str, str] = {}
-        if not preview:
+        if not preview and renders_mode != "none":
             from ...render import render_views
 
-            renders = render_views(Path(artifacts["stl"]), run_dir, mesh=mesh)
+            t = time.perf_counter()
+            only = ["iso"] if renders_mode == "thumbnail" else None
+            renders = render_views(Path(artifacts["stl"]), run_dir, mesh=mesh, only=only)
+            timings["render_s"] = round(time.perf_counter() - t, 3)
 
         return ExecutionResult(
             ok=True,
@@ -294,6 +530,9 @@ class PrecisionEngine:
             bbox=raw["bbox"],
             volume_mm3=raw["volume_mm3"],
             validation=validation,
+            timings=timings,
+            rss_peak_mb=rss_peak,
+            stl_facets=raw.get("stl_facets"),
         )
 
     def _validate_and_convert(

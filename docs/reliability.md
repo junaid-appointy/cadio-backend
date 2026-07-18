@@ -119,11 +119,71 @@ cgroup limit/usage — watch `used_pct` after builds. Verified in a local
 `docker run --memory=2g` of the production image: boot 8s, healthz 200,
 warm pool jobs 20–40ms.
 
-Deploy note: a big dependency-layer rebuild makes the image's new layers
-slow to pull; the platform's deploy workflow can time out and mark the
-deployment `failed` even though the build succeeded and the code is healthy —
-verify with a local `docker build` + `docker run` before assuming a code
-failure, then redeploy.
+## Deploying on Bifrost (read before pushing cadio-backend)
+
+Flow: this repo (`cadio.git`) is the source of truth; the backend subset is
+mirrored (rsync, minus `frontend/` and uncommitted docs) into
+`cadio-backend.git`, whose pushes trigger the webhook build + deploy. Compute
+tiers observed via `/healthz mem.limit_mb`: `standard` = **512MB**,
+`heavy` = **2048MB**.
+
+**Rollout wedge (2026-07-16/17):** the node (~3GB) cannot hold two `heavy`
+pods at once. A rolling update surges the new 2GB-request pod while the old
+one still runs → the new pod never schedules → the deploy workflow times out
+and reports `failed` (build `succeeded`, old pod keeps serving; even
+`bifrost deployment restart` wedges the same way). Deploys only "worked"
+historically when the old pod had just OOM-died. Until the platform gives this
+service `strategy: Recreate` (or a bigger node), ship with the **size-flip
+workaround**:
+
+1. `bifrost service update backend --compute-size standard` (512MB request
+   fits beside the old heavy pod), push/deploy → rollout succeeds, old heavy
+   pod terminates. The 512MB pod can serve but NOT build (boot 220MB + worker
+   360MB > 512MB) — keep this window short.
+2. `bifrost service update backend --compute-size heavy`, then
+   `bifrost deploy --service backend --environment dev` → the 2GB pod fits
+   beside the 0.5GB pod → rollout succeeds. Verify `/healthz` shows
+   `limit_mb: 2048` and a fresh (low) `rss_peak_mb`.
+
+`CADIO_POOL_SIZE` (default 2) right-sizes kernel workers per tier without a
+rebuild; it also caps total concurrent kernel processes (the exec gate).
+
+**Size-flip automation (2026-07-17):** `scripts/deploy_backend.sh` runs the
+whole flip (standard → deploy → heavy → deploy), polling `/healthz
+mem.limit_mb` at each step and finishing with a smoke check. The 512MB window
+is now safe: below `CADIO_MIN_BUILD_MEM_MB` (1024) the backend boots in
+**constrained mode** — pool never boots, builds are refused with
+"mid-deploy" messaging, `/healthz` shows `engine.constrained: true`. The
+durable fix remains a platform `strategy: Recreate` for this service — ask
+Bifrost; the script is the workaround until then.
+
+## Capacity tuning knobs (2026-07-17, the 2GB/1.5CPU tier defaults)
+
+| Env | Default | What it bounds |
+|---|---|---|
+| `CADIO_POOL_SIZE` | 2 | resident kernel workers + exec-gate width |
+| `CADIO_WORKER_MAX_DATA_MB` | 1800 | per-worker RLIMIT_DATA — runaway build dies alone (Linux); ≈1.2–1.3GB RSS (VmData ≈ RSS+550MB) |
+| `CADIO_WORKER_RECYCLE_RSS_MB` | 700 | recycle a worker whose RSS crept past this |
+| `CADIO_WORKER_RECYCLE_JOBS` | 80 | job-count recycle backstop (RSS is the real bound) |
+| `CADIO_MEM_PRESSURE_PCT` | 80 | above this (working set, cache excluded) with another job in flight: background/preview jobs shed; a second INTERACTIVE build waits — two near-rlimit workers at once is the one spike the pod can't survive |
+| `CADIO_AFFECT_MEM_PCT` | 70 | affect sweeps don't even start above this |
+| `CADIO_RENDER_MAX_FACES` | 18000 | render-proxy decimation (A/B 8000 before lowering fleet-wide) |
+| `CADIO_PREVIEW_GATE_TIMEOUT_S` | 4 | preview fast-fail (503 + Retry-After, client retries latest value) |
+| `CADIO_MAX_QUEUE_DEPTH` | 6 | queued interactive builds before global shed |
+| `CADIO_SHED_MEM_PCT` | 90 | cgroup % that triggers global shed |
+| `CADIO_MIN_BUILD_MEM_MB` | 1024 | below this cgroup limit the pod runs constrained (no builds) |
+
+Watch `/healthz`: `mem.peak_mb` (worst spike vs limit), `cpu.nr_throttled`
+(rising = the 1.5-CPU quota is the bottleneck), `engine.gate`
+(waiting_interactive > 0 sustained = at capacity), `engine.workers[].rss_mb`
+(recycling health), `affect_jobs`. Every saved run carries `timings` (per
+stage) + `rss_peak_mb` + `stl_facets` in its meta — optimization stays
+data-driven; `scripts/loadsim.py` drives a synthetic load and prints the
+percentiles.
+
+Also: a deploy `failed` status is about the rollout, not the code — a
+succeeded build + healthy local `docker run --memory=2g` means ship again,
+don't hunt phantom bugs.
 
 ## Known gaps (future hardening)
 

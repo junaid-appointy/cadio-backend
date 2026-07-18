@@ -266,10 +266,17 @@ class Orchestrator:
         self._budget_refusals = 0            # refusals issued after the budget spent
 
     def _supports_vision(self) -> bool:
+        # cached per model: consulted on every build now (it decides whether the
+        # engine renders all agent-eye views or just the thumbnail)
+        cache = getattr(self, "_vision_cache", None)
+        if cache is not None and cache[0] == self.model:
+            return cache[1]
         try:
-            return bool(litellm.supports_vision(model=self.model))
+            supported = bool(litellm.supports_vision(model=self.model))
         except Exception:
-            return False
+            supported = False
+        self._vision_cache = (self.model, supported)
+        return supported
 
     def set_history(self, messages: list[dict[str, Any]]) -> None:
         """Restore prior conversation (LLM format) so a resumed session
@@ -338,7 +345,25 @@ class Orchestrator:
         self._emit({"type": "status", "state": "running_cad", "label": label,
                     "attempt": n, "max_attempts": MAX_BUILDS_PER_TURN})
         run_dir = self.runs_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-        result = self.engine.execute(code, params, run_dir)
+        # renders: the full agent-eye set only when a vision model will actually
+        # look at them; otherwise just the iso thumbnail (~1/5 the render CPU).
+        # on_wait: when the box is saturated the user sees an honest queue
+        # position instead of a silently longer "building…" spinner. It fires
+        # UNDER the exec-gate lock, and delivery can block seconds on a dead
+        # socket — so the emit is dispatched on a throwaway thread.
+        def _queued(ahead: int) -> None:
+            threading.Thread(
+                target=self._emit, daemon=True,
+                args=({"type": "status", "state": "queued", "label": label,
+                       "position": ahead, "attempt": n,
+                       "max_attempts": MAX_BUILDS_PER_TURN},),
+            ).start()
+
+        result = self.engine.execute(
+            code, params, run_dir,
+            renders="full" if self._supports_vision() else "thumbnail",
+            on_wait=_queued,
+        )
         self.last_run_dir = run_dir
         self.last_run_id = run_dir.name
         self.last_program = code
@@ -355,6 +380,11 @@ class Orchestrator:
         payload = result.to_dict()
         payload.pop("run_dir", None)
         payload.pop("renders", None)
+        # profiling telemetry is for run meta / healthz, never for the LLM —
+        # it's context-window noise the model can do nothing with
+        payload.pop("timings", None)
+        payload.pop("rss_peak_mb", None)
+        payload.pop("stl_facets", None)
         if result.ok:
             payload["artifacts"] = sorted(result.artifacts)
         payload["attempts_used"] = f"{n}/{MAX_BUILDS_PER_TURN}"

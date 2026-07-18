@@ -55,6 +55,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from .. import affect, config, select, versions
 from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
+from ..engines.precision.engine import MEM_PRESSURE_ERROR, cgroup_mem_pct
 from ..storage import store as object_store
 from ..store import Store
 from . import auth, history, limits
@@ -132,10 +133,27 @@ app.add_middleware(
 )
 app.include_router(auth.router)
 # compress JSON responses — the pick map (face_ids.json is ~1 MB of ints on a
-# detailed model), run/history lists, etc. gzip ~10x on text; binary meshes barely
-# compress but are cache-immutable (below) so each downloads at most once. Range
-# requests aren't used by the viewer (STLLoader/GLB fetch whole files).
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+# detailed model), run/history lists, etc. gzip ~10x on text. Artifact/preview
+# files are EXCLUDED: on-the-fly gzip of binary meshes burned scarce CPU on
+# every download (previews are rate-limited at 120/min!) and Starlette's
+# streaming mode drops Content-Length, which killed the viewer's download
+# progress bar. Final STLs are precompressed ONCE at build time instead and
+# served with Content-Encoding by project_file below. Level 6 ≈ level 9's
+# ratio on JSON at a fraction of the CPU. Range requests aren't used by the
+# viewer (STLLoader/GLB fetch whole files).
+
+
+class SelectiveGZipMiddleware(GZipMiddleware):
+    _SKIP_PREFIXES = ("/files/", "/previews/")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").startswith(self._SKIP_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024, compresslevel=6)
 # reject oversized bodies early (added last → outermost → runs before route work)
 app.add_middleware(limits.BodyLimitMiddleware)
 # CORS last so it's the OUTERMOST layer (handles preflight before anything else).
@@ -169,6 +187,11 @@ def _mem_stats() -> dict:
     limit = _read_int("/sys/fs/cgroup/memory.max") or _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
     usage = _read_int("/sys/fs/cgroup/memory.current") or _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
     out: dict = {"limit_mb": mb(limit), "usage_mb": mb(usage)}
+    # worst spike since boot — the number that says how close a concurrent-build
+    # peak came to the cgroup limit, which current usage can't show
+    peak = _read_int("/sys/fs/cgroup/memory.peak")
+    if peak is not None:
+        out["peak_mb"] = mb(peak)
     # peak RSS of this process (ru_maxrss is KB on Linux)
     try:
         import resource
@@ -180,12 +203,32 @@ def _mem_stats() -> dict:
     return out
 
 
+def _cpu_stats() -> dict:
+    """cgroup-v2 CPU accounting. `nr_throttled`/`throttled_usec` rising is the
+    smoking gun that the 1.5-core quota (cpu.max) is the bottleneck."""
+    out: dict = {}
+    try:
+        quota = (Path("/sys/fs/cgroup") / "cpu.max").read_text().split()
+        if quota and quota[0] != "max":
+            out["cpus"] = round(int(quota[0]) / int(quota[1]), 2)
+        for line in (Path("/sys/fs/cgroup") / "cpu.stat").read_text().splitlines():
+            key, _, val = line.partition(" ")
+            if key in ("usage_usec", "throttled_usec", "nr_throttled"):
+                out[key] = int(val)
+    except Exception:
+        pass
+    return out
+
+
 @app.get("/healthz")
 def healthz():
     """Liveness probe for supervisors / load balancers — unauthenticated, no DB
-    or engine work, so it stays green even under load and never leaks state."""
+    or engine work, so it stays green even under load and never leaks state.
+    `engine` (gate depth, per-worker RSS) + `cpu` (throttling) are what you
+    watch to run the capped tier near capacity safely."""
     return {"ok": True, "connections": len(_active_ws), "inflight_builds": _inflight_build_count(),
-            "mem": _mem_stats()}
+            "mem": _mem_stats(), "cpu": _cpu_stats(), "engine": engine.stats(),
+            "affect_jobs": len(_affect_jobs)}
 
 
 # Developer-only diagnostics. These logs are for us (server console), never shown
@@ -240,8 +283,8 @@ def _current_model_note(pid: str, session: "ProjectSession", run_id: str,
     run = store.get_run(pid, run_id)
     if not run or not run.get("ok"):
         return None
-    prog_path = config.project_runs_dir(pid) / run_id / "program.py"
-    program = prog_path.read_text() if prog_path.exists() else None
+    prog_path = _run_file(pid, run_id, "program.py")  # restores from R2 on local miss
+    program = prog_path.read_text() if prog_path is not None else None
     include_program = bool(program) and program.strip() != (session.orch.last_program or "").strip()
     baseline = run["meta"].get("params") or {}
     params = live_params or baseline
@@ -251,9 +294,12 @@ def _current_model_note(pid: str, session: "ProjectSession", run_id: str,
 
 def _result_to_meta(run_id: str, result_dict: dict) -> dict:
     """Normalize an engine ExecutionResult dict for storage: keep facts, store
-    artifacts as bare filenames (URLs are computed per-project at read time)."""
+    artifacts as bare filenames (URLs are computed per-project at read time).
+    timings/rss_peak_mb/stl_facets ride along so every saved run carries its
+    per-stage profile — the data that steers tuning on the capped tier."""
     meta = {k: result_dict.get(k) for k in
-            ("ok", "params", "manifest", "bbox", "volume_mm3", "validation", "error", "duration_s")}
+            ("ok", "params", "manifest", "bbox", "volume_mm3", "validation", "error",
+             "duration_s", "timings", "rss_peak_mb", "stl_facets")}
     meta["run_id"] = run_id
     meta["artifacts"] = {kind: Path(p).name for kind, p in result_dict.get("artifacts", {}).items()}
     return meta
@@ -271,7 +317,8 @@ def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
     # worker pool the interactive turn needs.
     if meta.get("ok") and meta.get("manifest") and _run_valid(meta):
         run_dir = config.project_runs_dir(pid) / run_id
-        _ensure_precompute(run_dir, result_dict.get("params", {}), result_dict.get("manifest", []))
+        _schedule_affect(pid, run_id, run_dir,
+                         result_dict.get("params", {}), result_dict.get("manifest", []))
     # mirror the run's artifacts to R2 (durable copy; local disk stays a cache).
     # Best-effort and off the request path — inert when R2 is disabled.
     if meta.get("ok") and object_store.enabled:
@@ -290,26 +337,71 @@ def _save_run(pid: str, run_id: str, result_dict: dict, label: str,
 # agent/preview always keeps a pool worker free. The gate allows up to
 # (pool_size - 1) affect builds at once — so a bigger pool lets several users'
 # affect builds proceed concurrently instead of queueing behind one global lock.
+# Their kernel jobs additionally run at background priority in the engine's
+# exec gate, so they can never delay an interactive build.
 _affect_jobs: set[str] = set()          # run_dirs with a build queued or running
-_affect_reg_lock = threading.Lock()     # guards _affect_jobs
+_affect_reg_lock = threading.Lock()     # guards _affect_jobs + _affect_latest
+_affect_latest: dict[str, str] = {}     # pid -> latest valid run_id (supersede marker)
 _AFFECT_CONCURRENCY = int(os.environ.get(
     "CADIO_AFFECT_CONCURRENCY", str(max(1, engine._pool_size - 1))))
 _affect_gate = threading.BoundedSemaphore(_AFFECT_CONCURRENCY)
+# don't even START an affect sweep while the cgroup is this full — it's the
+# most deferrable work in the system
+_AFFECT_MEM_PCT = float(os.environ.get("CADIO_AFFECT_MEM_PCT", "70"))
 
 
-def _ensure_precompute(run_dir: Path, params: dict, manifest: list) -> None:
-    """Start a background affect build for this run unless one is already pending."""
+def _schedule_affect(pid: str, run_id: str, run_dir: Path, params: dict, manifest: list) -> None:
+    """Route a new valid run's affect precompute: during an agent turn (which can
+    save up to 5 valid runs, each superseded seconds later) just remember it —
+    ProjectSession._run_turn schedules ONE sweep for the last valid run when the
+    turn ends. Outside a turn, start immediately."""
+    with _affect_reg_lock:
+        _affect_latest[pid] = run_id
+    session = _sessions.get(pid)
+    if session is not None and session.busy:
+        session.pending_affect = (run_id, run_dir, params, manifest)
+        return
+    _ensure_precompute(run_dir, params, manifest, pid=pid, run_id=run_id)
+
+
+def _ensure_precompute(run_dir: Path, params: dict, manifest: list,
+                       pid: str | None = None, run_id: str | None = None) -> None:
+    """Start a background affect build for this run unless one is already pending.
+
+    When pid/run_id are given the sweep is SUPERSEDABLE: it aborts (between
+    per-parameter builds) as soon as a newer valid run exists — a user three
+    versions ahead must not have stale sweeps grinding the pool. The /affect
+    endpoint's lazy path passes pid=None (the user is explicitly LOOKING at that
+    version, however old) so it always runs to completion."""
     key = str(run_dir)
     with _affect_reg_lock:
         if key in _affect_jobs:
             return
         _affect_jobs.add(key)
 
+    def _still_wanted() -> bool:
+        if pid is None or run_id is None:
+            return True
+        with _affect_reg_lock:
+            return _affect_latest.get(pid, run_id) == run_id
+
     def job() -> None:
         try:
+            # memory-pressure delay: an affect sweep is pure background work, so
+            # while the cgroup is hot (a big build in flight) it waits its turn
+            # instead of piling a kernel process onto the spike.
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                pct = cgroup_mem_pct()
+                if pct is None or pct <= _AFFECT_MEM_PCT:
+                    break
+                time.sleep(2)
+            if not _still_wanted():
+                return
             with _affect_gate:  # cap concurrency so a live agent keeps a worker
                 code = (run_dir / "program.py").read_text()
-                affect.build_and_cache(engine, code, params, manifest, run_dir)
+                affect.build_and_cache(engine, code, params, manifest, run_dir,
+                                       should_continue=_still_wanted)
         except Exception:
             # best-effort; the client retries and the endpoint re-queues
             log.warning("affect build failed for %s", key, exc_info=True)
@@ -389,6 +481,20 @@ def project_runs(pid: str, user: dict = Depends(get_current_user)):
     return [_run_payload(pid, r) for r in store.list_runs(pid)]
 
 
+def _run_file(pid: str, run_id: str, name: str) -> Path | None:
+    """Local path of a per-run artifact, restored from R2 on a cache miss —
+    the same write-through-cache contract /files already honors. Without this,
+    a fresh container (or a laptop pointed at the shared DB) loads the model
+    fine via /files but serves EMPTY pick/affect maps for runs built elsewhere
+    — which silently hid the Move/Faces/Edges/Brush tools."""
+    target = config.project_runs_dir(pid) / run_id / name
+    if target.is_file():
+        return target
+    if object_store.enabled and object_store.download_to(f"{pid}/runs/{run_id}/{name}", target):
+        return target
+    return None
+
+
 @app.get("/api/projects/{pid}/runs/{run_id}/affect")
 def run_affect(pid: str, run_id: str, user: dict = Depends(get_current_user)):
     """{param_name: [affected face index, ...]} for a run. Served from the cached
@@ -400,15 +506,18 @@ def run_affect(pid: str, run_id: str, user: dict = Depends(get_current_user)):
     if not run:
         return JSONResponse({"error": "run not found"}, status_code=404)
     run_dir = config.project_runs_dir(pid) / run_id
-    cached = affect.affect_path(run_dir)
-    if cached.exists():
+    cached = _run_file(pid, run_id, "affect.json")
+    if cached is not None:
         try:
             return json.loads(cached.read_text())
         except (json.JSONDecodeError, OSError):
             pass
     meta = run["meta"]
-    if not _run_valid(meta) or not (run_dir / "program.py").exists():
+    # rebuilding the map needs the program AND the base mesh locally — restore
+    # both from R2 for runs built on another box/container life
+    if not _run_valid(meta) or _run_file(pid, run_id, "program.py") is None:
         return {}  # invalid/failed run: no affect map, and never rebuild it per-param
+    _run_file(pid, run_id, "model.stl")
     _ensure_precompute(run_dir, meta.get("params", {}), meta.get("manifest", []))
     return JSONResponse({}, status_code=202)  # building — client should retry
 
@@ -422,11 +531,10 @@ def run_facemap(pid: str, run_id: str, user: dict = Depends(get_current_user)):
     run = store.get_run(pid, run_id)
     if not run:
         return JSONResponse({"error": "run not found"}, status_code=404)
-    run_dir = config.project_runs_dir(pid) / run_id
 
     def _read(name: str, default):
-        path = run_dir / name
-        if not path.exists():
+        path = _run_file(pid, run_id, name)  # restores from R2 on local miss
+        if path is None:
             return default
         try:
             return json.loads(path.read_text())
@@ -456,6 +564,10 @@ def run_select(pid: str, run_id: str, req: SelectRequest, user: dict = Depends(g
     if not run:
         return JSONResponse({"error": "run not found"}, status_code=404)
     run_dir = config.project_runs_dir(pid) / run_id
+    # describe_selection reads the pick maps + mesh from the run dir — restore
+    # them from R2 first for runs built on another box/container life
+    for name in ("face_ids.json", "faces.json", "parts.json", "affect.json", "model.stl"):
+        _run_file(pid, run_id, name)
     desc = select.describe_selection(run_dir, req.face, anchor=req.anchor, precise=req.precise)
     if desc is None:
         return JSONResponse({"error": "could not resolve selection"}, status_code=422)
@@ -492,11 +604,44 @@ def _prune_previews(keep: int = 12) -> None:
         shutil.rmtree(stale, ignore_errors=True)
 
 
+# global admission bound: past this many queued interactive builds (or with the
+# cgroup nearly full) new work is rejected IMMEDIATELY with an honest message,
+# instead of everyone silently queueing into 30s-timeout territory.
+_MAX_QUEUE_DEPTH = int(os.environ.get("CADIO_MAX_QUEUE_DEPTH", "6"))
+_SHED_MEM_PCT = float(os.environ.get("CADIO_SHED_MEM_PCT", "90"))
+# a slider preview older than a few seconds is stale anyway — fail fast and let
+# the client retry the LATEST value instead of parking on the gate for 30s
+_PREVIEW_GATE_TIMEOUT_S = float(os.environ.get("CADIO_PREVIEW_GATE_TIMEOUT_S", "4"))
+
+
+def _at_capacity() -> str | None:
+    pct = cgroup_mem_pct()
+    if pct is not None and pct > _SHED_MEM_PCT:
+        return "the server is at capacity right now — please retry shortly"
+    if engine.gate_depth()["waiting_interactive"] > _MAX_QUEUE_DEPTH:
+        return "the server is at capacity right now — please retry shortly"
+    return None
+
+
+def _busy_result(result_error: str | None) -> bool:
+    """Engine errors that mean 'no capacity', not 'your program is wrong'."""
+    return bool(result_error) and (
+        result_error.startswith("the server is busy") or result_error == MEM_PRESSURE_ERROR)
+
+
 @app.post("/api/preview")
 def preview(req: PreviewRequest, user: dict = Depends(rate_limit("preview", 120, 60))):
-    """Fast, throwaway run for realtime slider tweaks: no STEP/GLB, no history."""
+    """Fast, throwaway run for realtime slider tweaks: no STEP/GLB, no history.
+    503 (+Retry-After) means capacity, not a broken program — the frontend
+    silently retries the latest pending slider value."""
+    if (msg := _at_capacity()) is not None:
+        return JSONResponse({"error": msg}, status_code=503, headers={"Retry-After": "2"})
     pdir = config.PREVIEW_DIR / uuid.uuid4().hex[:12]
-    result = engine.execute(req.code, req.params, pdir, preview=True)
+    result = engine.execute(req.code, req.params, pdir, preview=True,
+                            gate_timeout_s=_PREVIEW_GATE_TIMEOUT_S)
+    if not result.ok and _busy_result(result.error):
+        return JSONResponse({"error": result.error}, status_code=503,
+                            headers={"Retry-After": "2"})
     meta = result.to_dict()
     meta.pop("run_dir", None)
     meta["preview"] = True
@@ -514,11 +659,16 @@ def project_execute(pid: str, req: ExecuteRequest, user: dict = Depends(rate_lim
     require_project(pid, user)
     if not limits.check_daily_quota(store, user["id"]):
         return JSONResponse({"error": "daily build quota reached — try again tomorrow"}, status_code=429)
+    if (msg := _at_capacity()) is not None:
+        return JSONResponse({"error": msg}, status_code=503, headers={"Retry-After": "5"})
     if not limits.acquire_build_slot(user["id"]):
         return JSONResponse({"error": "a build is already running — wait for it to finish"}, status_code=429)
     try:
         run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time()*1000)%1000:03d}"
-        result = engine.execute(req.code, req.params, config.project_runs_dir(pid) / run_id)
+        # thumbnail-only renders: no vision model ever critiques a manual
+        # Code-tab run, so the full agent-eye set was pure waste
+        result = engine.execute(req.code, req.params, config.project_runs_dir(pid) / run_id,
+                                renders="thumbnail")
         payload = _save_run(pid, run_id, result.to_dict(), req.label or "", req.parent_run_id,
                             origin="manual")
         # a manual save is a checkpoint in the conversation: record a UI-only
@@ -628,6 +778,11 @@ class ProjectSession:
         self.answers_q: queue.Queue = queue.Queue()
         self.ask_pending = False
         self.pending_ask: list[dict] | None = None       # re-sent on reattach
+        # affect sweep deferred until the turn ends (last valid run wins) — an
+        # agent turn can save several runs, each superseded seconds later, and
+        # per-parameter sweeps for the stale ones would fight the turn for the
+        # worker pool: (run_id, run_dir, params, manifest)
+        self.pending_affect: tuple | None = None
         self.orch = Orchestrator(
             engine, config.project_runs_dir(pid),
             ask_user=self._ask_user, on_event=self._on_event, on_message=self._on_message,
@@ -748,6 +903,8 @@ class ProjectSession:
                 return "You already have a build running — wait for it to finish."
             if not limits.check_daily_quota(store, self.uid):
                 return "Daily build quota reached — try again tomorrow."
+            if (msg := _at_capacity()) is not None:
+                return msg  # honest global shed — don't park the turn in a deep queue
             if not limits.acquire_build_slot(self.uid):
                 return "You already have a build running — wait for it to finish."
             self.busy = True
@@ -770,6 +927,12 @@ class ProjectSession:
             limits.release_build_slot(self.uid)
             with self.lock:
                 self.busy = False
+                pending, self.pending_affect = self.pending_affect, None
+            # ONE affect sweep for the turn's final valid run, now that the
+            # interactive work is done (see _schedule_affect)
+            if pending is not None:
+                run_id, run_dir, params, manifest = pending
+                _ensure_precompute(run_dir, params, manifest, pid=self.pid, run_id=run_id)
             self.deliver({"type": "status", "state": "idle"})
             _maybe_evict_session(self)
 
@@ -964,7 +1127,7 @@ _IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 @app.get("/files/{pid}/{path:path}")
-def project_file(pid: str, path: str, user: dict = Depends(get_current_user)):
+def project_file(pid: str, path: str, request: Request, user: dict = Depends(get_current_user)):
     require_project(pid, user)
     base = config.project_dir(pid)
     target = (base / path).resolve()
@@ -975,6 +1138,21 @@ def project_file(pid: str, path: str, user: dict = Depends(get_current_user)):
         # repopulate from R2 if we have a durable copy there, else it's gone.
         if not object_store.download_to(f"{pid}/{path}", target):
             return JSONResponse({"error": "not found"}, status_code=404)
+    # big binary artifacts are gzipped ONCE at build time (model.stl.gz beside
+    # model.stl) — serving the precompressed copy costs zero request CPU and,
+    # unlike middleware gzip, keeps Content-Length so the viewer's download
+    # progress bar works. Bytes are identical after decode: facet order (which
+    # the pick/affect maps key off) is untouched.
+    if not path.endswith(".gz"):
+        gz = target.with_name(target.name + ".gz")
+        if gz.is_file() and "gzip" in request.headers.get("accept-encoding", "").lower():
+            import mimetypes
+
+            media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            return FileResponse(
+                gz, media_type=media_type,
+                headers={"Cache-Control": _IMMUTABLE, "Content-Encoding": "gzip",
+                         "Vary": "Accept-Encoding"})
     return FileResponse(target, headers={"Cache-Control": _IMMUTABLE})
 
 

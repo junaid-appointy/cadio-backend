@@ -13,6 +13,7 @@ import importlib.util
 import itertools
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -809,12 +810,43 @@ def write_edge_map(part, out: Path, id_faces: dict | None = None) -> None:
     (out / "edges.json").write_text(json.dumps(edges))
 
 
+def _rss_peak_mb() -> float | None:
+    """Peak RSS of THIS worker process in MB (ru_maxrss is KB on Linux, bytes
+    on macOS). The scarce-memory tier tunes worker rlimits off this number."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)
+    except Exception:
+        return None
+
+
+def _stl_facet_count(stl_path: Path) -> int | None:
+    """Facet count from the binary STL header (bytes 80:84) — every downstream
+    cost (validation, render, viewer decode) keys off this number."""
+    try:
+        with open(stl_path, "rb") as fh:
+            fh.seek(80)
+            return int.from_bytes(fh.read(4), "little")
+    except Exception:
+        return None
+
+
 def run_job(program: str, outdir: str, params: dict | None = None, preview: bool = False,
             coarse: bool = False) -> dict:
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     result = {"ok": False}
+    timings: dict[str, float] = {}
+
+    def _staged(name: str, t0: float) -> float:
+        now = time.perf_counter()
+        timings[name] = round(now - t0, 3)
+        return now
+
     try:
+        t = time.perf_counter()
         mod = load_program(Path(program))
         declared = validate_manifest(getattr(mod, "PARAMS", []))
         if not hasattr(mod, "build"):
@@ -822,6 +854,7 @@ def run_job(program: str, outdir: str, params: dict | None = None, preview: bool
         resolved = resolve_params(declared, params or {})
 
         part = mod.build(resolved)
+        t = _staged("build_s", t)
 
         from build123d import export_step, export_stl
 
@@ -849,10 +882,12 @@ def run_job(program: str, outdir: str, params: dict | None = None, preview: bool
             tol = min(0.15, max(0.02, 0.00025 * diag))
             export_stl(part, str(stl_path), tolerance=tol)
         artifacts["stl"] = str(stl_path)
+        t = _staged("stl_s", t)
         if not preview:  # STEP is for final exports; skip on live previews
             step_path = out / "model.step"
             export_step(part, str(step_path))
             artifacts["step"] = str(step_path)
+            t = _staged("step_s", t)
             # per-facet BREP face map (facet i -> source OCCT face) + per-edge
             # geometry — lets a viewer click select a WHOLE part (a named sub-solid,
             # a full cylinder) or an edge, not a mesh strip. An optional features()
@@ -864,10 +899,12 @@ def run_job(program: str, outdir: str, params: dict | None = None, preview: bool
                 result["warnings"] = naming_warnings
             except Exception:
                 pass
+            t = _staged("facemap_s", t)
             try:
                 write_edge_map(part, out, id_faces)
             except Exception:
                 pass
+            t = _staged("edgemap_s", t)
 
         bb = part.bounding_box()
         result.update(
@@ -882,13 +919,22 @@ def run_job(program: str, outdir: str, params: dict | None = None, preview: bool
                 },
                 "volume_mm3": float(part.volume),
                 "artifacts": artifacts,
+                "stl_facets": _stl_facet_count(stl_path),
             }
         )
+    except MemoryError:
+        # the worker's rlimit tripped — tell the AGENT what to do, crisply
+        result["error"] = (
+            "the model ran out of memory while building — simplify it: "
+            "reduce feature counts, fillet fewer edges at once, lower detail, "
+            "or build it in smaller staged steps.")
     except ManifestError as exc:
         # a single instructive sentence the agent can act on — no traceback noise
         result["error"] = f"PARAMS manifest invalid: {exc}"
     except Exception:
         result["error"] = traceback.format_exc()
+    result["timings"] = timings
+    result["rss_peak_mb"] = _rss_peak_mb()
     return result
 
 

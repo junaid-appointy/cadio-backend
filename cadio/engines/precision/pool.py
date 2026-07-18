@@ -29,6 +29,7 @@ import queue
 import select
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 _WORKER_SCRIPT = Path(__file__).parent / "_worker_loop.py"
@@ -36,8 +37,70 @@ _WORKER_SCRIPT = Path(__file__).parent / "_worker_loop.py"
 log = logging.getLogger("cadio.pool")
 
 # Jobs a worker serves before it is retired and respawned. Bounds OCCT/glibc
-# RSS creep: the cost is one ~3s re-import per N jobs.
-RECYCLE_AFTER_JOBS = int(os.environ.get("CADIO_WORKER_RECYCLE_JOBS", "40"))
+# RSS creep: the cost is one ~3s re-import per N jobs. RSS-based recycling
+# (below) is the real bound now, so the job count is a coarse backstop.
+RECYCLE_AFTER_JOBS = int(os.environ.get("CADIO_WORKER_RECYCLE_JOBS", "80"))
+
+# Recycle a worker whose resident set has crept past this — OCCT never returns
+# freed pages, so a worker that built one huge model stays huge forever unless
+# retired. Sized so two recycled-on-time workers + the API process fit a 2GB
+# cgroup with headroom.
+RECYCLE_RSS_MB = int(os.environ.get("CADIO_WORKER_RECYCLE_RSS_MB", "700"))
+
+# Per-worker allocation cap: a runaway build kills ITSELF with MemoryError
+# (turned into an instructive "simplify" error for the agent) instead of the
+# cgroup OOM-killing the whole pod. RLIMIT_DATA covers brk + private anonymous
+# mmap on Linux ≥4.7 — the segments that actually grow with geometry — while
+# leaving the large read-only OCCT dylib mappings out of the count.
+# Sizing (measured in the 2g production container, 2026-07-17): a warmed
+# worker sits at VmData ≈ RSS + ~550MB (arena reservations), so 1800MB VmData
+# ≈ ~1.2–1.3GB RSS — the most ONE worker can spend while main (~220MB) + a
+# second idle worker (~360MB) still fit the 2048MB cgroup.
+WORKER_MAX_DATA_MB = int(os.environ.get("CADIO_WORKER_MAX_DATA_MB", "1800"))
+
+
+def memory_limit_preexec():
+    """preexec_fn that applies the per-worker memory rlimit in the child
+    between fork and exec. Returns None on non-Linux (macOS dev: unlimited —
+    the OS absorbs pressure with swap/compression there anyway)."""
+    if sys.platform != "linux" or WORKER_MAX_DATA_MB <= 0:
+        return None
+
+    def _apply() -> None:
+        try:
+            import resource
+
+            cap = WORKER_MAX_DATA_MB * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
+        except Exception:
+            pass  # a worker without a cap is still better than no worker
+
+    return _apply
+
+
+def _worker_rss_mb(pid: int) -> float | None:
+    """Resident set of a worker in MB via /proc (Linux; None elsewhere)."""
+    try:
+        with open(f"/proc/{pid}/statm") as fh:
+            pages = int(fh.read().split()[1])
+        return round(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 1)
+    except Exception:
+        return None
+
+
+# Renicing a background job's worker requires renicing it BACK afterwards,
+# which an unprivileged process can't do (nice only goes up). Containers run
+# us as root so it works there; on a dev laptop we silently skip.
+_CAN_RENICE = hasattr(os, "setpriority") and (os.name != "posix" or os.geteuid() == 0)
+
+
+def _renice(pid: int, level: int) -> None:
+    if not _CAN_RENICE:
+        return
+    try:
+        os.setpriority(os.PRIO_PROCESS, pid, level)
+    except Exception:
+        pass
 
 
 class WorkerError(Exception):
@@ -74,6 +137,7 @@ class _Worker:
             text=True,
             env=env,
             cwd=scratch,
+            preexec_fn=memory_limit_preexec(),  # rlimit: runaway builds die alone
         )
         ready = self._read_line(boot_timeout_s)
         if not ready or not json.loads(ready).get("ready"):
@@ -150,9 +214,15 @@ class WorkerPool:
         # replacement memory is paid when the next job needs it, not while the
         # previous worker is still dying.
         self._idle: queue.Queue[_Worker | None] = queue.Queue()
+        # live-worker registry (pid -> worker) so /healthz can report each
+        # worker's RSS and job count — the numbers that tune recycle thresholds.
+        self._live: dict[int, _Worker] = {}
+        self._live_lock = threading.Lock()
         # boot ONE worker eagerly (fail fast + absorb the import cost up
         # front); the rest boot lazily so idle footprint starts at one kernel.
-        self._idle.put(_Worker(self.scratch, boot_timeout_s))
+        first = _Worker(self.scratch, boot_timeout_s)
+        self._track(first)
+        self._idle.put(first)
         for _ in range(size - 1):
             self._idle.put(None)
 
@@ -160,6 +230,11 @@ class WorkerPool:
         """Execute one job on an idle worker. Raises WorkerUnavailable when no
         slot frees up (saturation) and WorkerJobError when the job itself
         killed/timed out its worker; the caller decides on fallback."""
+        # host-side flag, not part of the sandbox job: background jobs (affect
+        # sweeps) run their worker at nice 10 so a concurrent interactive build
+        # wins the 1.5 shared cores. Reniced back after the job (root-only —
+        # see _CAN_RENICE; elsewhere the flag is a no-op).
+        background = bool(request.pop("_background", False))
         # bounded wait for a free slot: workers are always returned in `finally`
         # and each job self-times-out, so this only waits out genuinely in-flight
         # jobs. The ceiling is a safety net against a slot leaking un-returned
@@ -171,24 +246,63 @@ class WorkerPool:
         try:
             if worker is None:  # lazy slot — boot on demand
                 worker = _Worker(self.scratch, self.boot_timeout_s)
-            return worker.run(request, self.timeout_s)
+                self._track(worker)
+            if background:
+                _renice(worker.proc.pid, 10)
+            try:
+                return worker.run(request, self.timeout_s)
+            finally:
+                if background:
+                    _renice(worker.proc.pid, 0)
         except WorkerError:
             if worker is not None:
+                self._untrack(worker)
                 worker.kill()
             worker = None  # lazy respawn on the slot's next use
             raise
         finally:
-            if worker is not None and worker.jobs_served >= self.recycle_after:
-                log.info("recycling worker after %d jobs", worker.jobs_served)
-                worker.kill()
-                worker = None
+            if worker is not None:
+                rss = _worker_rss_mb(worker.proc.pid)
+                if worker.jobs_served >= self.recycle_after:
+                    log.info("recycling worker after %d jobs", worker.jobs_served)
+                    self._untrack(worker)
+                    worker.kill()
+                    worker = None
+                elif rss is not None and rss > RECYCLE_RSS_MB:
+                    # OCCT never returns freed pages — retire the bloated worker
+                    # now, while nothing depends on it, instead of carrying its
+                    # RSS into the next concurrent-build spike.
+                    log.info("recycling worker at %.0fMB RSS (cap %dMB, %d jobs)",
+                             rss, RECYCLE_RSS_MB, worker.jobs_served)
+                    self._untrack(worker)
+                    worker.kill()
+                    worker = None
             self._idle.put(worker)
+
+    def _track(self, worker: _Worker) -> None:
+        with self._live_lock:
+            self._live[worker.proc.pid] = worker
+
+    def _untrack(self, worker: _Worker) -> None:
+        with self._live_lock:
+            self._live.pop(worker.proc.pid, None)
+
+    def stats(self) -> list[dict]:
+        """Per-live-worker {pid, rss_mb, jobs} for /healthz."""
+        with self._live_lock:
+            workers = list(self._live.values())
+        return [
+            {"pid": w.proc.pid, "rss_mb": _worker_rss_mb(w.proc.pid), "jobs": w.jobs_served}
+            for w in workers
+            if w.proc.poll() is None
+        ]
 
     def shutdown(self) -> None:
         while not self._idle.empty():
             try:
                 w = self._idle.get_nowait()
                 if w is not None:
+                    self._untrack(w)
                     w.kill()
             except queue.Empty:
                 break

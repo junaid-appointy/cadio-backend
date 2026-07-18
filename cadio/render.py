@@ -9,6 +9,7 @@ but more than enough to judge form (which the numeric validation can't).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import matplotlib
@@ -31,8 +32,10 @@ _LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
 # The agent judges FORM (shape, proportion, missing/misplaced features), not
 # tessellation, so we render a decimated proxy — matplotlib's 3D backend is
 # Python-per-polygon, so a 270K-facet mesh takes seconds. ~18K facets looks the
-# same at 512px but renders ~10x faster.
-_RENDER_MAX_FACES = 18000
+# same at 512px but renders ~10x faster. Cost is ~linear in facets, so this env
+# knob is the biggest render-CPU lever on the 1.5-core tier (A/B 8000 against
+# real vision-model critiques before lowering the fleet default).
+_RENDER_MAX_FACES = int(os.environ.get("CADIO_RENDER_MAX_FACES", "18000"))
 _RENDER_SIZE = 512
 
 
@@ -79,18 +82,25 @@ def _feature_edges(mesh):
         return None
 
 
-def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None:
+def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach,
+                 segs=None) -> None:
     verts = np.asarray(mesh.vertices)
     tris = verts[np.asarray(mesh.faces)]
     colors = _shaded_faces(mesh)
     # OO Figure (not pyplot): no shared global state, so several of these can run
     # on separate threads at once (see render_views).
     fig = Figure(figsize=(size / 100, size / 100), dpi=100)
-    ax = fig.add_subplot(111, projection="3d")
+    # axes fill the figure exactly — bbox_inches="tight" at savefig forced a
+    # whole extra layout+draw pass per view just to trim margins, and the draw
+    # pass is the expensive part on a Python-per-polygon backend.
+    ax = fig.add_axes((0.0, 0.0, 1.0, 1.0), projection="3d")
     ax.add_collection3d(Poly3DCollection(tris, facecolors=colors, edgecolors="none"))
     # outline sharp feature edges (holes, cuts, corners) so misplaced/stray
     # features are visible — without the noise of every triangle edge.
-    segs = _feature_edges(mesh)
+    # computed ONCE per mesh by the caller (face-adjacency over the whole
+    # proxy), not per view.
+    if segs is None:
+        segs = _feature_edges(mesh)
     if segs is not None and len(segs):
         ax.add_collection3d(Line3DCollection(segs, colors="#2a1e0a", linewidths=0.6))
     for axis, c in zip("xyz", center):
@@ -99,16 +109,18 @@ def _render_mesh(mesh, elev, azim, path: Path, size: int, center, reach) -> None
     ax.view_init(elev=elev, azim=azim)
     ax.set_axis_off()
     fig.patch.set_facecolor("#14171c")
-    fig.savefig(str(path), facecolor="#14171c", bbox_inches="tight", pad_inches=0)
+    fig.savefig(str(path), facecolor="#14171c")
 
 
 def render_views(stl_path: Path, out_dir: Path, size: int = _RENDER_SIZE,
-                 mesh=None) -> dict[str, str]:
+                 mesh=None, only: list[str] | None = None) -> dict[str, str]:
     """Render the canonical views PLUS a cut-away section, so the agent can see
     interior features (walls, floors, bosses, cavities) it might have omitted.
     Returns {view_name: png_path}. Best-effort — returns {} on any failure.
     Pass `mesh` (an already-loaded trimesh) to skip re-reading the STL — the
     engine hands over the mesh it just validated so a build holds ONE copy.
+    Pass `only` (e.g. ["iso"]) to render a subset — used when no vision model
+    will look at the views, so only the project thumbnail is worth CPU.
 
     The mesh is decimated to a proxy first, because this sits on the build's
     critical path (it blocks the agent's turn) and matplotlib's 3D backend costs
@@ -130,29 +142,34 @@ def render_views(stl_path: Path, out_dir: Path, size: int = _RENDER_SIZE,
         # slice — slicing 18K faces is far cheaper than slicing the full mesh, and
         # the cut-away is only there for the agent to eyeball interior form.
         proxy = _decimate(mesh, _RENDER_MAX_FACES)
+        proxy_segs = _feature_edges(proxy)  # once per mesh, not per view
 
+        want = None if only is None else set(only)
         section_mesh = None
-        try:
-            sizes = mesh.bounds[1] - mesh.bounds[0]
-            axis = int(np.argmax(sizes[:2]))  # X or Y, whichever is longer
-            normal = np.zeros(3)
-            normal[axis] = 1.0
-            half = proxy.slice_plane(plane_origin=center, plane_normal=normal, cap=True)
-            if half is not None and len(half.faces) > 0:
-                section_mesh = (half, 18, -60 if axis == 0 else -30)
-        except Exception:
-            pass
+        if want is None or "section" in want:
+            try:
+                sizes = mesh.bounds[1] - mesh.bounds[0]
+                axis = int(np.argmax(sizes[:2]))  # X or Y, whichever is longer
+                normal = np.zeros(3)
+                normal[axis] = 1.0
+                half = proxy.slice_plane(plane_origin=center, plane_normal=normal, cap=True)
+                if half is not None and len(half.faces) > 0:
+                    section_mesh = (half, 18, -60 if axis == 0 else -30)
+            except Exception:
+                pass
 
-        jobs: list[tuple[str, object, float, float]] = [
-            (name, proxy, elev, azim) for name, (elev, azim) in _VIEWS.items()
+        jobs: list[tuple[str, object, float, float, object]] = [
+            (name, proxy, elev, azim, proxy_segs)
+            for name, (elev, azim) in _VIEWS.items()
+            if want is None or name in want
         ]
         if section_mesh is not None:
-            jobs.append(("section", section_mesh[0], section_mesh[1], section_mesh[2]))
+            jobs.append(("section", section_mesh[0], section_mesh[1], section_mesh[2], None))
 
         outputs: dict[str, str] = {}
-        for name, m, elev, azim in jobs:
+        for name, m, elev, azim, segs in jobs:
             path = out_dir / f"view_{name}.png"
-            _render_mesh(m, elev, azim, path, size, center, reach)
+            _render_mesh(m, elev, azim, path, size, center, reach, segs=segs)
             outputs[name] = str(path)
 
         iso = out_dir / "view_iso.png"

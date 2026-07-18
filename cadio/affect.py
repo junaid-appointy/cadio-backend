@@ -90,9 +90,12 @@ def _affected_faces(base_mesh, pert_mesh, threshold: float) -> list[int]:
 
 
 def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
-                       base_stl: Path) -> dict[str, list[int]]:
+                       base_stl: Path, should_continue=None) -> dict[str, list[int]]:
     """{param_name: [affected face index, ...]} for every perturbable parameter.
-    Best-effort: a parameter whose perturbed build fails is simply omitted."""
+    Best-effort: a parameter whose perturbed build fails is simply omitted.
+    `should_continue()` is checked between per-parameter builds so a sweep for a
+    superseded run stops instead of grinding the pool for a version nobody is on.
+    Kernel jobs run at background priority: interactive builds always go first."""
     import trimesh
 
     base = trimesh.load(str(base_stl), process=False)
@@ -104,6 +107,8 @@ def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
     out: dict[str, list[int]] = {}
     with tempfile.TemporaryDirectory() as tmp:
         for spec in manifest:
+            if should_continue is not None and not should_continue():
+                break
             name = spec["name"]
             if name not in params:
                 continue
@@ -112,7 +117,8 @@ def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
                 continue
             try:
                 result = engine.execute(
-                    code, {**params, name: newv}, Path(tmp) / name, preview=True, coarse=True)
+                    code, {**params, name: newv}, Path(tmp) / name, preview=True, coarse=True,
+                    priority=1)
                 if not result.ok or "stl" not in result.artifacts:
                     continue
                 # coarse build already yields a light mesh; decimate only if it's
@@ -129,13 +135,18 @@ def affect_path(run_dir: Path) -> Path:
 
 
 def build_and_cache(engine, code: str, params: dict, manifest: list[dict],
-                    run_dir: Path) -> dict[str, list[int]]:
-    """Compute the affect map for a saved run and cache it beside the artifacts."""
+                    run_dir: Path, should_continue=None) -> dict[str, list[int]]:
+    """Compute the affect map for a saved run and cache it beside the artifacts.
+    A sweep aborted by should_continue() caches NOTHING — a partial map would be
+    served as final forever; the lazy /affect path rebuilds when someone asks."""
     run_dir = Path(run_dir)
     base_stl = run_dir / "model.stl"
     if not base_stl.exists():
         return {}
-    amap = compute_affect_map(engine, code, params, manifest, base_stl)
+    amap = compute_affect_map(engine, code, params, manifest, base_stl,
+                              should_continue=should_continue)
+    if should_continue is not None and not should_continue():
+        return amap
     try:
         affect_path(run_dir).write_text(json.dumps(amap))
     except OSError:

@@ -67,6 +67,13 @@ class ExecutionResult:
     validation: ValidationReport | None = None
     error: str | None = None  # traceback / message when ok is False
     duration_s: float | None = None  # wall-clock time the build took (pool + export + render)
+    # per-stage profile (build_s/stl_s/step_s/facemap_s/edgemap_s from the
+    # sandbox; gate_wait_s/validate_s/glb_s/render_s from the host) — the data
+    # that steers optimization on the memory/CPU-capped tier. Never sent to the
+    # LLM (the orchestrator strips it from tool results).
+    timings: dict[str, float] = field(default_factory=dict)
+    rss_peak_mb: float | None = None  # sandbox process peak RSS for this job
+    stl_facets: int | None = None  # triangle count — what downstream cost keys off
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +88,9 @@ class ExecutionResult:
             "validation": self.validation.to_dict() if self.validation else None,
             "error": self.error,
             "duration_s": self.duration_s,
+            "timings": self.timings,
+            "rss_peak_mb": self.rss_peak_mb,
+            "stl_facets": self.stl_facets,
         }
 
 

@@ -80,6 +80,62 @@ superseded by Track A.
 
 ## Build log
 
+**2026-07-17 — capacity hardening: max output on the 3GB/1.5CPU node.**
+Whole-node budget (backend 2048MB cgroup + frontend nginx + overhead on
+3GB/1.5CPU), optimized for max concurrent users with zero OOM. Plan:
+`~/.claude/plans/vast-watching-minsky.md`.
+- **Telemetry first**: per-stage timings (`build/stl/step/facemap/edgemap` in
+  the sandbox; `gate_wait/validate_glb/stl_gz/render` on the host) +
+  `rss_peak_mb` + `stl_facets` ride every run meta (stripped from LLM
+  payloads); `/healthz` gains cgroup `cpu.stat` (throttling), `memory.peak`,
+  engine gate depth, per-worker RSS/job counts, affect queue depth.
+- **Memory safety**: per-worker `RLIMIT_DATA` (`CADIO_WORKER_MAX_DATA_MB`,
+  1800 ≈ 1.2–1.3GB RSS; VmData runs ~550MB above RSS, container-measured) — a
+  runaway build dies with an instructive MemoryError instead of the
+  cgroup killing the pod; RSS-based worker recycling
+  (`CADIO_WORKER_RECYCLE_RSS_MB` 700, job backstop raised 40→80);
+  memory-pressure admission (`CADIO_MEM_PRESSURE_PCT` 80) sheds
+  background/preview kernel jobs while a spike is in flight.
+- **CPU per build**: renders are now `full | thumbnail | none` — the full
+  5-view agent-eye set only when the model actually supports vision; manual
+  Code-tab runs render just the iso thumbnail (~1/5 the render CPU);
+  matplotlib fixed-axes savefig (no `bbox_inches="tight"` relayout);
+  `CADIO_RENDER_MAX_FACES` knob; feature edges computed once per mesh.
+- **Bandwidth/CPU**: GZip middleware to level 6 and OFF `/files` +
+  `/previews`; final STLs precompressed once at build (`model.stl.gz`) and
+  served with `Content-Encoding: gzip` + real `Content-Length` (viewer
+  progress bar works again; decoded bytes identical → facet order preserved).
+- **Scheduling**: the exec gate is now a priority gate — background (affect)
+  kernel jobs run only when no interactive caller waits, niced to 10 in
+  containers; affect sweeps are superseded mid-sweep by newer runs and
+  deferred to end-of-turn (one sweep for the final valid run instead of up
+  to 5).
+- **Honest saturation**: agent builds emit `queued (n ahead)` WS status from
+  the gate; `/api/preview` fast-fails 503+Retry-After at 4s
+  (`CADIO_PREVIEW_GATE_TIMEOUT_S`) and the frontend silently retries the
+  latest value; global shed (`CADIO_MAX_QUEUE_DEPTH` 6, `CADIO_SHED_MEM_PCT`
+  90) rejects new work with a plain message instead of 30s hangs.
+- **Deploy**: constrained mode — a pod whose cgroup is under
+  `CADIO_MIN_BUILD_MEM_MB` (1024) never boots the pool and refuses builds
+  honestly (the 512MB size-flip window used to accept builds and OOM);
+  `scripts/deploy_backend.sh` automates the size-flip verifying `/healthz`
+  at each step.
+- **Frontend**: `frameloop="demand"` (idle canvas costs ~0 CPU; all
+  imperative mutations — recolor, brush ring, paint strokes, camera fit —
+  now `invalidate()`); display-mesh refinement skips already-dense (>250K
+  facet) sources and caps at `min(600K, 4×src)`.
+- **Verification**: `scripts/loadsim.py` (canned-program builds + preview
+  bursts + affect polling, no LLM keys) — local run green: preview p50 89ms
+  under 3 users, affect ready, gate waits ~0; container harness:
+  `docker run --memory=2g --memory-swap=2g --cpus=1.5`.
+- **Fix: pick tools vanished for runs built elsewhere.** `/files` restores
+  artifacts from R2 on a local cache miss, but the facemap/affect/select
+  endpoints read the run dir directly — so a fresh container (or a laptop on
+  the shared DB) loaded the model fine yet served EMPTY pick maps, and the
+  Move/Faces/Edges/Brush bar silently unmounted after load. New `_run_file()`
+  helper (`app.py`) gives those endpoints (+ the current-model program note)
+  the same R2 write-through-cache fallback.
+
 **2026-07-17 — build UX overhaul: narration, budgets, staged building.**
 Response to real-user pain (castle: 3 invalid versions + a stuck viewer;
 streamdeck case on a weak model: 9 invalid versions with a silent spinner):
