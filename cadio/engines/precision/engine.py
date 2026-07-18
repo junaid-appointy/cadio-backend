@@ -73,6 +73,35 @@ def cgroup_mem_limit_mb() -> int | None:
     return None if limit is None else limit // (1024 * 1024)
 
 
+def cgroup_cpus() -> float | None:
+    """CPU cores the pod's cgroup actually grants (cpu.max = "quota period"), or
+    None when unlimited/unreadable (a dev laptop). This is the number the pod
+    gets, NOT the namespace quota — on Bifrost `heavy` it reads 0.75, and the
+    self-tuning defaults below key off it so an underpowered pod right-sizes
+    itself without hand-set env vars."""
+    try:
+        quota, period = (_CGROUP / "cpu.max").read_text().split()[:2]
+        if quota == "max":
+            return None
+        return round(int(quota) / int(period), 2)
+    except Exception:
+        return None
+
+
+# Below this many granted cores a second resident kernel worker only
+# oversubscribes the CPU (two OCCT builds can't run in parallel on <1 core) and
+# background affect sweeps can't finish before their worker times out — so the
+# pool defaults to 1 worker and eager affect precompute defaults off. Both are
+# still overridable via CADIO_POOL_SIZE / CADIO_AFFECT_PRECOMPUTE.
+_LOW_CPU_THRESHOLD = float(os.environ.get("CADIO_LOW_CPU_THRESHOLD", "1.25"))
+
+
+def low_cpu_pod() -> bool:
+    """True when the pod's granted CPU is under the single-worker threshold."""
+    cpus = cgroup_cpus()
+    return cpus is not None and cpus < _LOW_CPU_THRESHOLD
+
+
 _mem_pct_cache: tuple[float, float | None] = (0.0, None)
 _mem_pct_lock = threading.Lock()
 
@@ -230,9 +259,16 @@ class PrecisionEngine:
                  use_pool: bool = True):
         # CADIO_POOL_SIZE tunes resident kernel workers (~360MB each) per
         # deployment tier without a rebuild: 1 for a 1GB container, 2 for 2GB+.
-        # It also sizes the exec gate (total concurrent kernel processes).
+        # It also sizes the exec gate (total concurrent kernel processes). When
+        # unset, the pod self-tunes off its GRANTED cpu (cpu.max): a sub-1.25-core
+        # pod (e.g. Bifrost heavy = 0.75 CPU) defaults to 1 worker so two builds
+        # can't oversubscribe less than a core and starve interactive previews.
         if pool_size is None:
-            pool_size = max(1, int(os.environ.get("CADIO_POOL_SIZE", "2")))
+            env = os.environ.get("CADIO_POOL_SIZE")
+            if env is not None:
+                pool_size = max(1, int(env))
+            else:
+                pool_size = 1 if low_cpu_pod() else 2
         self.timeout_s = timeout_s
         self._pool: WorkerPool | None = None
         self._pool_size = pool_size

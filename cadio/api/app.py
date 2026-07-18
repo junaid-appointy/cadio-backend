@@ -55,7 +55,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from .. import affect, config, select, versions
 from ..agent.orchestrator import DEFAULT_MODEL, Orchestrator
 from ..engines.precision import PrecisionEngine
-from ..engines.precision.engine import MEM_PRESSURE_ERROR, cgroup_mem_pct
+from ..engines.precision.engine import MEM_PRESSURE_ERROR, cgroup_mem_pct, low_cpu_pod
 from ..storage import store as object_store
 from ..store import Store
 from . import auth, history, limits
@@ -348,6 +348,16 @@ _affect_gate = threading.BoundedSemaphore(_AFFECT_CONCURRENCY)
 # don't even START an affect sweep while the cgroup is this full — it's the
 # most deferrable work in the system
 _AFFECT_MEM_PCT = float(os.environ.get("CADIO_AFFECT_MEM_PCT", "70"))
+# Eager affect precompute kill-switch. On an underpowered pod (e.g. the 0.75-CPU
+# dev box) sweeping every parameter of every saved run in the background pegs the
+# CPU and starves interactive slider previews — the sweep never finishes and just
+# crash-loops kernel workers. When unset it defaults OFF on a low-CPU pod (same
+# cpu.max threshold that sizes the worker pool) and ON otherwise; force it either
+# way with CADIO_AFFECT_PRECOMPUTE=1/0. Off, the lazy /affect path still builds
+# the map on demand when a user clicks a parameter, so highlighting keeps working
+# without the background grind.
+_affect_env = os.environ.get("CADIO_AFFECT_PRECOMPUTE")
+_AFFECT_PRECOMPUTE = (_affect_env != "0") if _affect_env is not None else not low_cpu_pod()
 
 
 def _schedule_affect(pid: str, run_id: str, run_dir: Path, params: dict, manifest: list) -> None:
@@ -355,6 +365,8 @@ def _schedule_affect(pid: str, run_id: str, run_dir: Path, params: dict, manifes
     save up to 5 valid runs, each superseded seconds later) just remember it —
     ProjectSession._run_turn schedules ONE sweep for the last valid run when the
     turn ends. Outside a turn, start immediately."""
+    if not _AFFECT_PRECOMPUTE:
+        return  # lazy /affect path builds the map on demand instead
     with _affect_reg_lock:
         _affect_latest[pid] = run_id
     session = _sessions.get(pid)

@@ -13,9 +13,18 @@ viewer, and the frontend can recolour them directly.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("cadio.affect")
+
+# Consecutive per-parameter build failures before a sweep gives up (see the
+# crash-loop guard in compute_affect_map). Each failure kills+reboots a kernel
+# worker, so a low cap keeps a too-heavy model from grinding the pool.
+_MAX_CONSECUTIVE_FAILS = int(os.environ.get("CADIO_AFFECT_MAX_FAILS", "3"))
 
 
 def _perturbed_value(spec: dict, value: Any):
@@ -105,6 +114,15 @@ def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
     threshold = max(0.15, 0.0025 * diag)
 
     out: dict[str, list[int]] = {}
+    # Crash-loop guard: a per-parameter build that fails (kernel crash / OOM /
+    # timeout / capacity shed) kills+reboots a worker. On an underpowered box a
+    # too-heavy model fails EVERY parameter, so an un-capped sweep grinds the
+    # whole manifest re-booting a fresh ~360MB worker each time — pegging the
+    # pod and starving interactive previews (that is exactly what wedged the
+    # 0.75-CPU dev pod). After this many CONSECUTIVE failures, give up on the
+    # sweep: this model can't be swept here right now. A single success resets
+    # the count, so a lone flaky parameter doesn't abort an otherwise-fine run.
+    consecutive_fail = 0
     with tempfile.TemporaryDirectory() as tmp:
         for spec in manifest:
             if should_continue is not None and not should_continue():
@@ -120,12 +138,23 @@ def compute_affect_map(engine, code: str, params: dict, manifest: list[dict],
                     code, {**params, name: newv}, Path(tmp) / name, preview=True, coarse=True,
                     priority=1)
                 if not result.ok or "stl" not in result.artifacts:
+                    consecutive_fail += 1
+                    if consecutive_fail >= _MAX_CONSECUTIVE_FAILS:
+                        log.warning("aborting affect sweep after %d consecutive failed builds "
+                                    "(model too heavy for this box?): %s", consecutive_fail,
+                                    result.error)
+                        break
                     continue
                 # coarse build already yields a light mesh; decimate only if it's
                 # still large (a fallback cold build ignores `coarse`).
                 pert = _coarsen(trimesh.load(result.artifacts["stl"], process=False), _DIFF_MAX_FACES)
                 out[name] = _affected_faces(base, pert, threshold)
+                consecutive_fail = 0
             except Exception:
+                consecutive_fail += 1
+                if consecutive_fail >= _MAX_CONSECUTIVE_FAILS:
+                    log.warning("aborting affect sweep after %d consecutive errors", consecutive_fail)
+                    break
                 continue
     return out
 

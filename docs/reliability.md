@@ -119,16 +119,94 @@ cgroup limit/usage — watch `used_pct` after builds. Verified in a local
 `docker run --memory=2g` of the production image: boot 8s, healthz 200,
 warm pool jobs 20–40ms.
 
+## CPU starvation: affect sweeps wedged the pod (2026-07-18)
+
+Symptom: models built fine, but **parameter-slider changes never reflected** —
+the "updating" spinner hung, or the preview completed and nothing changed. The
+box was `heavy` (2048MB) but only **0.75 CPU**.
+
+Diagnosis came straight from `/healthz` polled over ~75s:
+- `engine.gate.in_flight` pinned at **1** the whole time (a kernel job always
+  held a gate slot), while `inflight_builds: 0` (no user build).
+- `engine.workers` cycled pids (75 → 79 …) with **`jobs: 0`** — no worker ever
+  *completed* a job. A boot → run → die loop.
+- `affect_jobs: 3` never drained; `mem` idle at ~47%; `cpu.nr_throttled` high.
+
+Root cause: the **affect-map precompute** (nudge each parameter, rebuild, diff —
+the "what does this knob change" highlight map) runs its kernel builds at
+background priority, **niced to 10**. On 0.75 heavily-throttled cores a niced
+build can't finish inside the 90s worker timeout, so it's killed and the sweep
+skips to the next parameter (`continue`) — re-booting a fresh ~360MB worker each
+time. Three queued sweeps ground the CPU forever. Interactive **previews** lost
+because they have the shortest gate timeout (`CADIO_PREVIEW_GATE_TIMEOUT_S` = 4s)
+and, once past the gate, competed for CPU with the crash-loop; agent builds still
+won (30s gate wait + interactive priority), which is why "models load" but slider
+tweaks didn't. The priority gate orders *queued* acquirers but can't preempt an
+*in-flight* background job, so on an effectively-one-worker box a running affect
+build still blocks a preview.
+
+Fixes:
+1. **Crash-loop guard** (`affect.py`): a sweep aborts after
+   `CADIO_AFFECT_MAX_FAILS` (3) *consecutive* failed per-parameter builds — a
+   too-heavy model no longer grinds the whole manifest re-booting workers. One
+   success resets the counter.
+2. **Eager-precompute kill-switch** (`app.py`): `CADIO_AFFECT_PRECOMPUTE=0`
+   disables the background "sweep every param of every saved run" work. The lazy
+   `/affect` path still builds the map on demand when a user clicks a parameter
+   label, so highlighting keeps working without the background grind. Set this on
+   any sub-1-CPU pod.
+3. **Right-size**: on 0.75 CPU, two kernel workers oversubscribe <1 core —
+   `CADIO_POOL_SIZE=1` matches workers to cores. Or move to `extra_heavy` for
+   more CPU (read the actual grant from `/healthz` after; see tier table above).
+
 ## Deploying on Bifrost (read before pushing cadio-backend)
 
 Flow: this repo (`cadio.git`) is the source of truth; the backend subset is
 mirrored (rsync, minus `frontend/` and uncommitted docs) into
-`cadio-backend.git`, whose pushes trigger the webhook build + deploy. Compute
-tiers observed via `/healthz mem.limit_mb`: `standard` = **512MB**,
-`heavy` = **2048MB**.
+`cadio-backend.git`, whose pushes trigger the webhook build + deploy.
 
-**Rollout wedge (2026-07-16/17):** the node (~3GB) cannot hold two `heavy`
-pods at once. A rolling update surges the new 2GB-request pod while the old
+**Compute tiers (2026-07-18).** The ladder is `micro` < `standard` < `heavy` <
+`extra_heavy` (`bifrost service create --help`). Bifrost stores only the tier
+*label* on the service (`compute_size` in `bifrost service get`); it does **not**
+publish the CPU/RAM each tier grants — the CLI has no command for it and the
+catalog API returns 403. The only reliable way to learn a tier's real limits is
+to deploy onto it and read the pod's cgroup back from `/healthz` (`mem.limit_mb`,
+`cpu.cpus`). Measured this way:
+
+| Tier | RAM (`mem.limit_mb`) | CPU (`cpu.cpus`) | Where |
+|---|---|---|---|
+| `standard` | 512MB | ? | (old backend window) |
+| `heavy` | 2048MB | **0.75** | backend now |
+| `micro` | ? | ? | frontend (nginx, no `/healthz` cgroup probe) |
+| `extra_heavy` | ? | ? | never deployed — bump + read `/healthz` to learn |
+
+**`heavy` is 0.75 CPU, not 1.5.** The "1.5 CPU" in older notes is the *namespace
+total* quota shared across services, **not** what the heavy pod gets — the pod's
+cgroup reports `cpu.cpus: 0.75`. Tuning that assumed 1.5 was sized for 2× the CPU
+the pod actually has. This is the root of the affect-starvation incident below.
+Backend is `heavy`, frontend is `micro` (confirmed via `bifrost service list`).
+
+**The environment quota is the real ceiling (2026-07-18).** The `dev` namespace
+(`env-c800a7f2-01c5048c-dev`, type `development`) has a **total** budget of
+**1.5 CPU / 3072Mi / 30Gi**, shared across *all* services — visible only in the
+dashboard (the `bifrost environment get` CLI doesn't return it, and there's no
+CLI flag to change it; raising it is a dashboard/support action). Per-service
+tier requests are bounded by this. Current split: backend `heavy` = 0.75 CPU /
+2048Mi (half the CPU, ⅔ the RAM), leaving ~0.75 CPU / ~1024Mi for the frontend
+`micro` plus any surge.
+
+**Implication for `extra_heavy`:** it does **not** fit on this env. A bigger pod
+alongside the frontend would exceed 1.5 CPU / 3072Mi, and a *rolling* deploy
+(old `heavy` + new `extra_heavy` live at once) blows the quota outright — the same
+mechanism as the "two `heavy` pods don't fit" wedge below, worse. So on the
+current namespace the only way to give the backend more CPU is to **raise the
+environment quota first** (dashboard), *then* bump the tier. Until then, the
+software levers (`CADIO_AFFECT_PRECOMPUTE=0`, `CADIO_POOL_SIZE=1`) are the only
+lever available.
+
+**Rollout wedge (2026-07-16/17):** the namespace quota (3072Mi — see the
+environment-quota note above) cannot hold two `heavy` pods at once (2×2048Mi >
+3072Mi). A rolling update surges the new 2GB-request pod while the old
 one still runs → the new pod never schedules → the deploy workflow times out
 and reports `failed` (build `succeeded`, old pod keeps serving; even
 `bifrost deployment restart` wedges the same way). Deploys only "worked"
@@ -157,7 +235,7 @@ is now safe: below `CADIO_MIN_BUILD_MEM_MB` (1024) the backend boots in
 durable fix remains a platform `strategy: Recreate` for this service — ask
 Bifrost; the script is the workaround until then.
 
-## Capacity tuning knobs (2026-07-17, the 2GB/1.5CPU tier defaults)
+## Capacity tuning knobs (2026-07-17; `heavy` = 2GB / **0.75 CPU** measured — not 1.5)
 
 | Env | Default | What it bounds |
 |---|---|---|
@@ -167,6 +245,8 @@ Bifrost; the script is the workaround until then.
 | `CADIO_WORKER_RECYCLE_JOBS` | 80 | job-count recycle backstop (RSS is the real bound) |
 | `CADIO_MEM_PRESSURE_PCT` | 80 | above this (working set, cache excluded) with another job in flight: background/preview jobs shed; a second INTERACTIVE build waits — two near-rlimit workers at once is the one spike the pod can't survive |
 | `CADIO_AFFECT_MEM_PCT` | 70 | affect sweeps don't even start above this |
+| `CADIO_AFFECT_PRECOMPUTE` | 1 | `0` disables background affect sweeps (lazy `/affect` still serves on click) — set on sub-1-CPU pods |
+| `CADIO_AFFECT_MAX_FAILS` | 3 | consecutive failed per-param builds before a sweep aborts (crash-loop guard) |
 | `CADIO_RENDER_MAX_FACES` | 18000 | render-proxy decimation (A/B 8000 before lowering fleet-wide) |
 | `CADIO_PREVIEW_GATE_TIMEOUT_S` | 4 | preview fast-fail (503 + Retry-After, client retries latest value) |
 | `CADIO_MAX_QUEUE_DEPTH` | 6 | queued interactive builds before global shed |
@@ -174,9 +254,11 @@ Bifrost; the script is the workaround until then.
 | `CADIO_MIN_BUILD_MEM_MB` | 1024 | below this cgroup limit the pod runs constrained (no builds) |
 
 Watch `/healthz`: `mem.peak_mb` (worst spike vs limit), `cpu.nr_throttled`
-(rising = the 1.5-CPU quota is the bottleneck), `engine.gate`
-(waiting_interactive > 0 sustained = at capacity), `engine.workers[].rss_mb`
-(recycling health), `affect_jobs`. Every saved run carries `timings` (per
+(rising = the pod's 0.75-CPU share is the bottleneck), `engine.gate`
+(waiting_interactive > 0 sustained = at capacity; `in_flight` pinned with
+`inflight_builds: 0` = background affect wedged), `engine.workers[].rss_mb`
+(recycling health; `jobs` stuck at 0 while pids cycle = a crash-loop),
+`affect_jobs` (not draining = sweeps grinding). Every saved run carries `timings` (per
 stage) + `rss_peak_mb` + `stl_facets` in its meta — optimization stays
 data-driven; `scripts/loadsim.py` drives a synthetic load and prints the
 percentiles.
