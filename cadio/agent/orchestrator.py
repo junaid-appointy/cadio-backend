@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import os
 import threading
@@ -25,6 +26,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+log = logging.getLogger("cadio.agent")
 
 import litellm
 
@@ -42,11 +45,19 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("CADIO_MAX_OUTPUT_TOKENS", "32000"))
 # How many times to re-prompt after a truncated, tool-less response before giving
 # up with a real message (never raw code) — guards against an infinite retry loop.
 MAX_TRUNCATION_RETRIES = 2
-# Builds allowed in ONE turn before the agent must stop and talk to the user.
-# A weak model that can't fix a validation error will otherwise rebuild forever
-# (observed: 9 invalid versions in a single request) while the user stares at
-# "building model…". Override with CADIO_MAX_BUILDS_PER_TURN.
-MAX_BUILDS_PER_TURN = int(os.environ.get("CADIO_MAX_BUILDS_PER_TURN", "5"))
+# PRODUCTIVE (clean) builds allowed in ONE turn before the agent must stop and
+# talk to the user. Only builds that produce clean geometry count — a complex
+# model is built in stages (massing, then feature batches; see corpus.py), and a
+# too-low budget delivered a coarse, under-parameterized model because it was
+# spent before the agent finished staging. Override with CADIO_MAX_BUILDS_PER_TURN.
+MAX_BUILDS_PER_TURN = int(os.environ.get("CADIO_MAX_BUILDS_PER_TURN", "8"))
+# Hard ceiling on TOTAL run_cad attempts in a turn (clean + failed). Separate
+# from the productive budget so a failing/timing-out build on a slow box can't
+# starve the refinement loop (each failure used to burn the productive budget),
+# while a weak model that rebuilds forever (observed: 9 invalid versions in one
+# request) is still stopped. Override with CADIO_MAX_BUILD_ATTEMPTS.
+MAX_BUILD_ATTEMPTS = int(os.environ.get(
+    "CADIO_MAX_BUILD_ATTEMPTS", str(MAX_BUILDS_PER_TURN * 2)))
 
 # validation code -> one plain sentence the USER sees in the live status line
 # while the agent reworks the model. Keep these human: no jargon, no traceback.
@@ -260,21 +271,34 @@ class Orchestrator:
         self.last_usage: dict[str, Any] | None = None  # token/cost/time of the last turn
         self._turn_renders: list[Path] = []  # renders from the current turn's builds
         self._stop = threading.Event()
-        self._turn_builds = 0                # run_cad calls in the current turn
+        self._turn_builds = 0                # total run_cad attempts in the turn (clean+failed)
+        self._turn_clean = 0                 # clean builds only — the productive budget
         self._last_failure_code: str | None = None  # for repeat-failure escalation
         self._failure_streak = 0
         self._budget_refusals = 0            # refusals issued after the budget spent
 
     def _supports_vision(self) -> bool:
         # cached per model: consulted on every build now (it decides whether the
-        # engine renders all agent-eye views or just the thumbnail)
+        # engine renders all agent-eye views or just the thumbnail). If litellm's
+        # registry doesn't yet know a new model id it answers False and the agent
+        # silently loses its self-critique eyes — so CADIO_FORCE_VISION lets us
+        # override when we KNOW the configured model is vision-capable. The
+        # resolved decision is logged once per model so a thumbnail-only fallback
+        # is never invisible again.
         cache = getattr(self, "_vision_cache", None)
         if cache is not None and cache[0] == self.model:
             return cache[1]
-        try:
-            supported = bool(litellm.supports_vision(model=self.model))
-        except Exception:
-            supported = False
+        forced = os.environ.get("CADIO_FORCE_VISION", "").strip().lower() in ("1", "true", "yes")
+        if forced:
+            supported = True
+        else:
+            try:
+                supported = bool(litellm.supports_vision(model=self.model))
+            except Exception:
+                supported = False
+        log.info("vision renders %s for model %s%s",
+                 "ON" if supported else "OFF (thumbnail-only — agent has no eyes)",
+                 self.model, " (forced)" if forced and supported else "")
         self._vision_cache = (self.model, supported)
         return supported
 
@@ -370,7 +394,9 @@ class Orchestrator:
         self._emit({"type": "run", "run_id": run_dir.name, "label": label,
                     "result": result.to_dict()})
         clean = bool(result.ok and (result.validation is None or result.validation.ok))
-        if not clean:
+        if clean:
+            self._turn_clean += 1  # only clean builds count against the productive budget
+        else:
             self._emit({"type": "status", "state": "fixing", "attempt": n,
                         "max_attempts": MAX_BUILDS_PER_TURN,
                         "detail": _friendly_failure(result)})
@@ -416,12 +442,15 @@ class Orchestrator:
 
     def _over_budget(self) -> str | None:
         """A refusal payload once the per-turn build budget is spent, else None.
-        The refusal instructs the model to wrap up honestly instead of building."""
-        if self._turn_builds < MAX_BUILDS_PER_TURN:
+        Two independent limits: enough PRODUCTIVE (clean) builds delivered, or too
+        many TOTAL attempts (a mostly-failing turn). Either one means stop and talk
+        to the user — but failures alone no longer exhaust the productive budget."""
+        if self._turn_clean < MAX_BUILDS_PER_TURN and self._turn_builds < MAX_BUILD_ATTEMPTS:
             return None
         self._budget_refusals += 1
         return json.dumps({
-            "error": f"build budget for this turn is exhausted ({MAX_BUILDS_PER_TURN} builds)",
+            "error": (f"build budget for this turn is exhausted "
+                      f"({self._turn_clean} clean of {self._turn_builds} attempts)"),
             "instruction": (
                 "Do NOT build again this turn. Reply to the user now with: (1) what "
                 "you built and what state the latest version is in, (2) the one issue "
@@ -481,7 +510,7 @@ class Orchestrator:
                                "image_asset_ids": [img["id"] for img in (images or [])]})
         self._turn_renders = []
         self._stop.clear()
-        self._turn_builds = 0
+        self._turn_builds = self._turn_clean = 0
         self._last_failure_code, self._failure_streak = None, 0
         self._budget_refusals = 0
         # per-turn accounting: a turn may make several LLM calls (tool loop)

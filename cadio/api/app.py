@@ -432,7 +432,19 @@ def get_config():
         p: bool(os.environ.get(f"{p.upper()}_API_KEY"))
         for p in ("anthropic", "openai", "gemini", "xai")
     }
-    return {"default_model": DEFAULT_MODEL, "provider_keys": provider_keys}
+    # whether the default model gets the agent's full render "eyes" — surfaced so
+    # a thumbnail-only fallback (litellm not recognizing a new model id) is
+    # verifiable from outside without reading server logs. CADIO_FORCE_VISION wins.
+    if os.environ.get("CADIO_FORCE_VISION", "").strip().lower() in ("1", "true", "yes"):
+        vision = True
+    else:
+        try:
+            import litellm
+            vision = bool(litellm.supports_vision(model=DEFAULT_MODEL))
+        except Exception:
+            vision = False
+    return {"default_model": DEFAULT_MODEL, "provider_keys": provider_keys,
+            "default_model_vision": vision}
 
 
 @app.get("/api/example")
